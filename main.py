@@ -25,7 +25,7 @@ BIZ_ID = os.getenv("BIZ_ID", "demo").strip()
 CURRENCY = os.getenv("CURRENCY", "UAH").strip()
 SOURCE = os.getenv("SOURCE", "Telegram").strip()
 
-WEBHOOK_BASE = os.getenv("WEBHOOK_BASE", "").strip()  # e.g. https://your-service.onrender.com
+WEBHOOK_BASE = os.getenv("WEBHOOK_BASE", "").strip()  # e.g. https://tg-order-bot-lywy.onrender.com
 WEBHOOK_PATH = os.getenv("WEBHOOK_PATH", "/webhook").strip()
 PORT = int(os.getenv("PORT", "10000"))
 
@@ -559,4 +559,5 @@ def build_app():
 
 if __name__ == "__main__":
     web.run_app(build_app(), host="0.0.0.0", port=PORT)
+
 
