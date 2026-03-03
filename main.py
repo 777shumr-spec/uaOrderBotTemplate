@@ -229,7 +229,7 @@ async def fileid_photo(m: Message):
         return
 
     photo = m.photo[-1]
-    await m.answer(f"✅ file_id:\n`{photo.file_id}`", parse_mode="Markdown")
+    await m.answer(f"✅ file_id:\n{photo.file_id}")
 
 
 # 2) Альбом (media_group)
@@ -242,7 +242,7 @@ async def fileid_album(m: Message):
 
     if m.photo:
         photo = m.photo[-1]
-        await m.answer(f"✅ file_id (album):\n`{photo.file_id}`", parse_mode="Markdown")
+        await m.answer(f"✅ file_id:\n{photo.file_id}")
 
 
 # 3) Гарантований перехват (коли Telegram/aiogram не дає спрацювати F.photo)
@@ -256,7 +256,7 @@ async def admin_fileid_catchall(m: Message):
 
     if m.photo:
         photo = m.photo[-1]
-        await m.answer(f"✅ file_id:\n`{photo.file_id}`", parse_mode="Markdown")
+        await m.answer(f"✅ file_id:\n{photo.file_id}")
         return
 
     await m.answer("Надішли саме фото (Gallery/Фото), не файл. Або вимкни режим: /fileidoff")
@@ -628,6 +628,7 @@ def build_app():
 
 if __name__ == "__main__":
     web.run_app(build_app(), host="0.0.0.0", port=PORT)
+
 
 
 
