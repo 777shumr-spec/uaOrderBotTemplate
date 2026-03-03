@@ -46,16 +46,16 @@ if not WEBHOOK_BASE:
 # =========================
 CATALOG = {
     "Десерти": [
-        {"sku": "cake_napoleon", "title": "Торт «Наполеон»", "price": 650},
-        {"sku": "cake_honey", "title": "Торт «Медовик»", "price": 620},
-        {"sku": "cupcake", "title": "Капкейки (1 шт)", "price": 55},
+        {"sku": "cake_napoleon", "title": "Торт «Наполеон»", "price": 650, "photo": "AgACAgIAAxkBAAOdaab0HY12878k8OAnDwV_pJjkVQsAAkYTaxvOjDlJQYBq-IPJcSQBAAMCAANtAAM6BA"},
+        {"sku": "cake_honey", "title": "Торт «Медовик»", "price": 620, "photo": "AgACAgIAAxkBAAObaab0FnC3pkssG8ZdFQuYd8WY9IwAAkUTaxvOjDlJTBar3BbZh5EBAAMCAANtAAM6BA"},
+        {"sku": "cupcake", "title": "Капкейки (1 шт)", "price": 55, "photo": "AgACAgIAAxkBAAOVaabz-C5YXwKqrPRzXw7UtzJfhHkAAkITaxvOjDlJdC34GFtFGf0BAAMCAAN5AAM6BA"},
     ],
     "Напої": [
-        {"sku": "coffee", "title": "Кава", "price": 60},
-        {"sku": "tea", "title": "Чай", "price": 40},
+        {"sku": "coffee", "title": "Кава", "price": 60, "photo": "AgACAgIAAxkBAAOZaab0Dv8hYBTSwZZBIY-7YFayRFMAAkQTaxvOjDlJ_TLHnFebP9cBAAMCAAN4AAM6BA"},
+        {"sku": "tea", "title": "Чай", "price": 40, "photo": "AgACAgIAAxkBAAOXaab0AAEGGf_f6oDotHPYl8agvHVzAAJDE2sbzow5SRdQOqvfBqu9AQADAgADeQADOgQ"},
     ],
     "Інше": [
-        {"sku": "gift_box", "title": "Подарункова коробка", "price": 80},
+        {"sku": "gift_box", "title": "Подарункова коробка", "price": 80, "photo": "AgACAgIAAxkBAAN7aabwno4x3rFsLX6VfmbBFE9vdtsAAhMTaxvOjDlJj4MhYEhqQ_cBAAMCAAN4AAM6BA"},
     ],
 }
 
@@ -308,13 +308,30 @@ async def cat(cb: CallbackQuery):
 async def prod(cb: CallbackQuery):
     sku = cb.data.split(":", 1)[1]
     item = find_item_by_sku(sku)
+
     if not item:
         await cb.answer("Товар не знайдено", show_alert=True)
         return
-    await cb.message.edit_text(
-        f"🧾 {item['title']}\nЦіна: {item['price']} {CURRENCY}\n\nДодати в кошик?",
-        reply_markup=product_kb(sku)
+
+    text = (
+        f"🧾 {item['title']}\n"
+        f"💰 Ціна: {item['price']} {CURRENCY}\n\n"
+        "Додати в кошик?"
     )
+
+    # Якщо є фото — показуємо фото
+    if item.get("photo"):
+        await cb.message.answer_photo(
+            photo=item["photo"],
+            caption=text,
+            reply_markup=product_kb(sku)
+        )
+    else:
+        await cb.message.answer(
+            text,
+            reply_markup=product_kb(sku)
+        )
+
     await cb.answer()
 
 
@@ -612,6 +629,7 @@ def build_app():
 
 if __name__ == "__main__":
     web.run_app(build_app(), host="0.0.0.0", port=PORT)
+
 
 
 
