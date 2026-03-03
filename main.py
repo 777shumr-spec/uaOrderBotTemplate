@@ -183,7 +183,12 @@ dp = Dispatcher()
 @dp.message(CommandStart())
 async def start(m: Message):
     await m.answer(
-        "Привіт! Я бот для прийому замовлень.\n\nОбери дію в меню нижче 👇",
+        "👋 Вітаємо у нашій кондитерській!
+
+🎂 Замовляйте торти та десерти онлайн за 1 хвилину.
+Менеджер одразу підтвердить замовлення.
+
+Оберіть дію нижче 👇",
         reply_markup=main_menu_kb()
     )
 
@@ -534,3 +539,4 @@ def build_app():
 if __name__ == "__main__":
 
     web.run_app(build_app(), host="0.0.0.0", port=PORT)
+
