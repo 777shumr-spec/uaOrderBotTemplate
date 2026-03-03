@@ -1,0 +1,10 @@
+services:
+  - type: web
+    name: tg-order-bot
+    env: docker
+    plan: free
+    autoDeploy: true
+    dockerfilePath: ./Dockerfile
+    envVars:
+      - key: WEBHOOK_PATH
+        value: /webhook
