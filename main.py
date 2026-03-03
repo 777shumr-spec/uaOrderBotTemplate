@@ -178,7 +178,22 @@ async def gs_update_status(session: ClientSession, order_id: str, status: str) -
 bot = Bot(BOT_TOKEN)
 dp = Dispatcher()
 
+@dp.message()
+async def debug_any(m: Message):
+    # тільки адміни, щоб не засмічувати клієнтам
+    if ADMIN_IDS and m.from_user.id not in ADMIN_IDS:
+        return
 
+    # покажемо що саме прилетіло
+    parts = []
+    parts.append(f"type: photo={bool(m.photo)} document={bool(m.document)} text={bool(m.text)} media_group_id={m.media_group_id}")
+    if m.photo:
+        parts.append(f"photo_sizes: {len(m.photo)}")
+        parts.append(f"best_file_id: {m.photo[-1].file_id}")
+    if m.document:
+        parts.append(f"document_file_id: {m.document.file_id}")
+        parts.append(f"mime: {m.document.mime_type}")
+    await m.answer("DEBUG:\n" + "\n".join(parts))
 
 
 
@@ -613,6 +628,7 @@ def build_app():
 
 if __name__ == "__main__":
     web.run_app(build_app(), host="0.0.0.0", port=PORT)
+
 
 
 
