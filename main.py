@@ -1,9 +1,10 @@
 import os
 import json
+import asyncio
 from datetime import datetime
 from typing import Dict, Any, List, Optional
 
-from aiohttp import web, ClientSession
+from aiohttp import web, ClientSession, ClientTimeout
 from aiogram import Bot, Dispatcher, F
 from aiogram.types import (
     Message, CallbackQuery,
@@ -25,10 +26,14 @@ BIZ_ID = os.getenv("BIZ_ID", "demo").strip()
 CURRENCY = os.getenv("CURRENCY", "UAH").strip()
 SOURCE = os.getenv("SOURCE", "Telegram").strip()
 
+# Webhook settings (optional now)
 WEBHOOK_BASE = os.getenv("WEBHOOK_BASE", "").strip()  # e.g. https://tg-order-bot-lywy.onrender.com
 WEBHOOK_PATH = os.getenv("WEBHOOK_PATH", "/webhook").strip()
+
+# Render provides PORT env, use it if present
 PORT = int((os.getenv("PORT", "10000") or "10000"))
 
+# HARD requirements (bot must run)
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is required")
 if not GS_ENDPOINT:
@@ -37,11 +42,12 @@ if not GS_KEY:
     raise RuntimeError("GS_KEY is required")
 if MANAGER_CHAT_ID == 0:
     raise RuntimeError("MANAGER_CHAT_ID is required")
-if not WEBHOOK_BASE:
-    raise RuntimeError("WEBHOOK_BASE is required")
 
-# Нормалізуємо BASE (без слеша в кінці)
-WEBHOOK_BASE = WEBHOOK_BASE.rstrip("/")
+# Normalize WEBHOOK_BASE if set
+if WEBHOOK_BASE:
+    WEBHOOK_BASE = WEBHOOK_BASE.rstrip("/")
+
+USE_WEBHOOK = bool(WEBHOOK_BASE)
 
 # =========================
 # Catalog
@@ -149,22 +155,31 @@ def cart_text(user_id: int) -> str:
     lines.append(f"\nРазом: {calc_total(user_id)} {CURRENCY}")
     return "\n".join(lines)
 
+# HTTP client timeouts (stability)
+HTTP_TIMEOUT = ClientTimeout(total=20)
+
 async def gs_create_order(session: ClientSession, payload: Dict[str, Any]) -> Dict[str, Any]:
-    async with session.post(GS_ENDPOINT, json=payload, timeout=20) as resp:
-        text = await resp.text()
-        try:
-            return json.loads(text)
-        except Exception:
-            return {"ok": False, "error": f"Bad response: {text[:200]}"}
+    try:
+        async with session.post(GS_ENDPOINT, json=payload, timeout=HTTP_TIMEOUT) as resp:
+            text = await resp.text()
+            try:
+                return json.loads(text)
+            except Exception:
+                return {"ok": False, "error": f"Bad JSON response: {text[:200]}"}
+    except Exception as e:
+        return {"ok": False, "error": f"GS request failed: {repr(e)}"}
 
 async def gs_update_status(session: ClientSession, order_id: str, status: str) -> Dict[str, Any]:
     payload = {"key": GS_KEY, "action": "updateStatus", "bizId": BIZ_ID, "orderId": order_id, "status": status}
-    async with session.post(GS_ENDPOINT, json=payload, timeout=20) as resp:
-        text = await resp.text()
-        try:
-            return json.loads(text)
-        except Exception:
-            return {"ok": False, "error": f"Bad response: {text[:200]}"}
+    try:
+        async with session.post(GS_ENDPOINT, json=payload, timeout=HTTP_TIMEOUT) as resp:
+            text = await resp.text()
+            try:
+                return json.loads(text)
+            except Exception:
+                return {"ok": False, "error": f"Bad JSON response: {text[:200]}"}
+    except Exception as e:
+        return {"ok": False, "error": f"GS request failed: {repr(e)}"}
 
 # =========================
 # Bot + Dispatcher
@@ -462,7 +477,7 @@ async def confirm(cb: CallbackQuery):
         }
     }
 
-    async with ClientSession() as session:
+    async with ClientSession(timeout=HTTP_TIMEOUT) as session:
         res = await gs_create_order(session, order_payload)
 
     if not res.get("ok"):
@@ -507,7 +522,7 @@ async def set_status(cb: CallbackQuery):
         return
 
     _, order_id, status, user_tg_id = cb.data.split(":", 3)
-    async with ClientSession() as session:
+    async with ClientSession(timeout=HTTP_TIMEOUT) as session:
         res = await gs_update_status(session, order_id, status)
 
     if res.get("ok"):
@@ -523,21 +538,22 @@ async def set_status(cb: CallbackQuery):
 # Webhook server (aiohttp)
 # =========================
 async def on_startup(app: web.Application):
+    if not USE_WEBHOOK:
+        print("⚠️ WEBHOOK_BASE is empty -> starting in LONG-POLLING mode (no webhook).")
+        return
+
     webhook_url = f"{WEBHOOK_BASE}{WEBHOOK_PATH}"
     try:
         await bot.delete_webhook(drop_pending_updates=True)
-        await bot.set_webhook(
-            webhook_url,
-            allowed_updates=["message", "callback_query"]
-        )
+        await bot.set_webhook(webhook_url, allowed_updates=["message", "callback_query"])
         print("✅ Webhook set to:", webhook_url)
     except Exception as e:
-        # якщо set_webhook впаде — ти це побачиш в Render logs
         print("❌ set_webhook failed:", repr(e))
 
 async def on_shutdown(app: web.Application):
     try:
-        await bot.delete_webhook(drop_pending_updates=True)
+        if USE_WEBHOOK:
+            await bot.delete_webhook(drop_pending_updates=True)
     except Exception:
         pass
     await bot.session.close()
@@ -549,26 +565,35 @@ async def handle_webhook(request: web.Request):
         return web.Response(text="ok")
     except Exception as e:
         print("Webhook handler error:", repr(e))
-        # ВАЖЛИВО: не віддаємо 500 Telegram’у
         return web.Response(text="ok")
+
+async def health(_request):
+    return web.Response(text="ok")
+
+async def start_long_polling():
+    # ВАЖЛИВО: webhook має бути очищений для polling
+    try:
+        await bot.delete_webhook(drop_pending_updates=True)
+    except Exception:
+        pass
+    print("✅ Long-polling started")
+    await dp.start_polling(bot, allowed_updates=["message", "callback_query"])
 
 def build_app():
     app = web.Application()
-
-    async def health(_request):
-        return web.Response(text="ok")
-
     app.router.add_get("/", health)
     app.router.add_post(WEBHOOK_PATH, handle_webhook)
-
     app.on_startup.append(on_startup)
     app.on_shutdown.append(on_shutdown)
     return app
 
 if __name__ == "__main__":
-    web.run_app(build_app(), host="0.0.0.0", port=PORT)
-
-
+    if USE_WEBHOOK:
+        # Normal Render webhook mode
+        web.run_app(build_app(), host="0.0.0.0", port=PORT)
+    else:
+        # Demo-safe fallback mode
+        asyncio.run(start_long_polling())
 
 
 
