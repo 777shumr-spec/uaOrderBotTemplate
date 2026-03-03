@@ -1,5 +1,6 @@
 import os
 import json
+import asyncio
 from datetime import datetime
 from typing import Dict, Any, List, Optional
 
@@ -16,16 +17,8 @@ from aiogram.filters import CommandStart, Command
 # ENV
 # =========================
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-
-ADMIN_IDS = set(
-    int(x) for x in os.getenv("ADMIN_IDS", "").split(",")
-    if x.strip().isdigit()
-)
-
-# IMPORTANT:
-# For private chat, chat_id == user_id (positive).
-# For groups/supergroups it is negative.
-MANAGER_CHAT_ID = int((os.getenv("MANAGER_CHAT_ID", "0").strip() or "0"))
+ADMIN_IDS = set(int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip().isdigit())
+MANAGER_CHAT_ID = int((os.getenv("MANAGER_CHAT_ID", "0") or "0").strip())
 
 GS_ENDPOINT = os.getenv("GS_ENDPOINT", "").strip()
 GS_KEY = os.getenv("GS_KEY", "").strip()
@@ -33,13 +26,8 @@ BIZ_ID = os.getenv("BIZ_ID", "demo").strip()
 CURRENCY = os.getenv("CURRENCY", "UAH").strip()
 SOURCE = os.getenv("SOURCE", "Telegram").strip()
 
-WEBHOOK_BASE = os.getenv("WEBHOOK_BASE", "").strip()  # e.g. https://tg-order-bot-lywy.onrender.com
-WEBHOOK_PATH = os.getenv("WEBHOOK_PATH", "/webhook").strip()
-
-# Render sets PORT. Sometimes it can be empty string in misconfigs -> protect.
 PORT = int(os.getenv("PORT", "10000") or "10000")
 
-# Hard requirements (keep strict for production)
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is required")
 if not GS_ENDPOINT:
@@ -48,14 +36,9 @@ if not GS_KEY:
     raise RuntimeError("GS_KEY is required")
 if MANAGER_CHAT_ID == 0:
     raise RuntimeError("MANAGER_CHAT_ID is required")
-if not WEBHOOK_BASE:
-    raise RuntimeError("WEBHOOK_BASE is required")
-
-# Normalize base (remove trailing slash)
-WEBHOOK_BASE = WEBHOOK_BASE.rstrip("/")
 
 # =========================
-# Simple demo catalog (in code)
+# Catalog
 # =========================
 CATALOG = {
     "Десерти": [
@@ -79,13 +62,15 @@ CATALOG = {
 }
 
 # =========================
-# State (RAM) - OK for demo
+# State (RAM)
 # =========================
-carts: Dict[int, Dict[str, int]] = {}   # user_id -> {sku: qty}
-draft: Dict[int, Dict[str, Any]] = {}   # user_id -> order draft fields
-fileid_mode: Dict[int, bool] = {}       # user_id -> True/False
+carts: Dict[int, Dict[str, int]] = {}
+draft: Dict[int, Dict[str, Any]] = {}
+fileid_mode: Dict[int, bool] = {}
 
-
+# =========================
+# Helpers
+# =========================
 def now_str() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
@@ -138,9 +123,9 @@ def manager_status_kb(order_id: str, user_tg_id: str) -> InlineKeyboardMarkup:
 
 
 def find_item_by_sku(sku: str) -> Optional[Dict[str, Any]]:
-    for _, items in CATALOG.items():
+    for items in CATALOG.values():
         for it in items:
-            if it.get("sku") == sku:
+            if it["sku"] == sku:
                 return it
     return None
 
@@ -186,17 +171,11 @@ async def gs_update_status(session: ClientSession, order_id: str, status: str) -
         except Exception:
             return {"ok": False, "error": f"Bad response: {text[:200]}"}
 
-
 # =========================
-# Bot + Dispatcher
+# Bot
 # =========================
 bot = Bot(BOT_TOKEN)
 dp = Dispatcher()
-
-# ---------- diagnostics ----------
-@dp.message(Command("ping"))
-async def ping(m: Message):
-    await m.answer("pong ✅")
 
 # ---------- file_id helper ----------
 @dp.message(Command("fileid"))
@@ -210,14 +189,12 @@ async def fileid_help(m: Message):
         "Щоб вимкнути — /fileidoff"
     )
 
-
 @dp.message(Command("fileidoff"))
 async def fileid_off(m: Message):
     if ADMIN_IDS and m.from_user.id not in ADMIN_IDS:
         return
     fileid_mode[m.from_user.id] = False
     await m.answer("✅ Режим file_id вимкнено.")
-
 
 @dp.message(F.photo)
 async def fileid_photo(m: Message):
@@ -228,13 +205,16 @@ async def fileid_photo(m: Message):
     photo = m.photo[-1]
     await m.answer(f"✅ file_id:\n{photo.file_id}")
 
-
-# Catch-all only when fileid_mode enabled (won't affect normal flow)
 @dp.message()
 async def admin_fileid_catchall(m: Message):
+    # щоб не ламати звичайну роботу — працює тільки в режимі /fileid
     if ADMIN_IDS and m.from_user.id not in ADMIN_IDS:
         return
     if not fileid_mode.get(m.from_user.id, False):
+        return
+
+    # не перехоплюємо команди
+    if m.text and m.text.strip().startswith("/"):
         return
 
     if m.photo:
@@ -242,8 +222,8 @@ async def admin_fileid_catchall(m: Message):
         await m.answer(f"✅ file_id:\n{photo.file_id}")
         return
 
+    # якщо в режимі file_id надіслали не фото
     await m.answer("Надішли саме фото (Gallery/Фото), не файл. Або вимкни режим: /fileidoff")
-
 
 # ---------- main bot ----------
 @dp.message(CommandStart())
@@ -256,12 +236,14 @@ async def start(m: Message):
     )
     await m.answer(welcome_text, reply_markup=main_menu_kb())
 
+@dp.message(Command("ping"))
+async def ping(m: Message):
+    await m.answer("pong ✅")
 
 @dp.message(F.text == "📦 Каталог / Меню")
 @dp.message(F.text == "🛒 Зробити замовлення")
 async def show_catalog(m: Message):
     await m.answer("Оберіть категорію:", reply_markup=categories_kb())
-
 
 @dp.message(F.text == "🚚 Доставка та оплата")
 async def delivery(m: Message):
@@ -272,22 +254,18 @@ async def delivery(m: Message):
         "Оплата: готівка/переказ (на старті)."
     )
 
-
 @dp.message(F.text == "☎️ Контакти")
 async def contacts(m: Message):
     await m.answer("☎️ Контакти:\nМенеджер: @ruslanshum\nТел: +380973080330")
-
 
 @dp.message(F.text == "🧾 Мої замовлення")
 async def my_orders_stub(m: Message):
     await m.answer("🧾 Поки що в демо показ 'Мої замовлення' буде на наступному кроці.")
 
-
 @dp.callback_query(F.data == "cats")
 async def cats(cb: CallbackQuery):
     await cb.message.edit_text("Оберіть категорію:", reply_markup=categories_kb())
     await cb.answer()
-
 
 @dp.callback_query(F.data.startswith("cat:"))
 async def cat(cb: CallbackQuery):
@@ -305,7 +283,6 @@ async def cat(cb: CallbackQuery):
     await cb.message.edit_text("\n".join(text_lines), reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
     await cb.answer()
 
-
 @dp.callback_query(F.data.startswith("prod:"))
 async def prod(cb: CallbackQuery):
     sku = cb.data.split(":", 1)[1]
@@ -320,6 +297,7 @@ async def prod(cb: CallbackQuery):
         "Додати в кошик?"
     )
 
+    # Щоб не плодити повідомлення — просто надсилаємо карточку товару з фото/без фото
     if item.get("photo"):
         await cb.message.answer_photo(photo=item["photo"], caption=text, reply_markup=product_kb(sku))
     else:
@@ -327,14 +305,12 @@ async def prod(cb: CallbackQuery):
 
     await cb.answer()
 
-
 @dp.callback_query(F.data.startswith("add:"))
 async def add(cb: CallbackQuery):
     sku = cb.data.split(":", 1)[1]
     carts.setdefault(cb.from_user.id, {})
     carts[cb.from_user.id][sku] = carts[cb.from_user.id].get(sku, 0) + 1
     await cb.answer("Додано ✅")
-
 
 @dp.callback_query(F.data.startswith("rem:"))
 async def rem(cb: CallbackQuery):
@@ -347,12 +323,10 @@ async def rem(cb: CallbackQuery):
     else:
         await cb.answer("У кошику немає", show_alert=False)
 
-
 @dp.callback_query(F.data == "cart")
 async def cart(cb: CallbackQuery):
     await cb.message.edit_text(cart_text(cb.from_user.id), reply_markup=cart_kb())
     await cb.answer()
-
 
 @dp.callback_query(F.data == "clear")
 async def clear(cb: CallbackQuery):
@@ -360,7 +334,6 @@ async def clear(cb: CallbackQuery):
     draft.pop(cb.from_user.id, None)
     await cb.message.edit_text("🧺 Кошик очищено.", reply_markup=categories_kb())
     await cb.answer()
-
 
 @dp.callback_query(F.data == "checkout")
 async def checkout(cb: CallbackQuery):
@@ -371,9 +344,8 @@ async def checkout(cb: CallbackQuery):
     await cb.message.answer("✍️ Введіть ваше ім’я:")
     await cb.answer()
 
-
-# IMPORTANT: text-only flow, so it won't swallow photos
-@dp.message(F.text)
+# flow має приймати І текст, І contact (бо contact — НЕ текст)
+@dp.message(F.text | F.contact)
 async def flow(m: Message):
     user_id = m.from_user.id
     if user_id not in draft:
@@ -457,7 +429,7 @@ async def flow(m: Message):
             f"Ім’я: {draft[user_id]['name']}",
             f"Телефон: {draft[user_id]['phone']}",
             f"Тип: {draft[user_id]['deliveryType']}",
-            f"Адреса: {draft[user_id].get('address', '-')}",
+            f"Адреса: {draft[user_id].get('address','-')}",
             f"Дата/час: {draft[user_id]['datetime']}",
             f"Коментар: {draft[user_id]['comment'] or '-'}",
         ]
@@ -474,14 +446,12 @@ async def flow(m: Message):
         draft[user_id]["step"] = "confirm_wait"
         return
 
-
 @dp.callback_query(F.data == "cancel")
 async def cancel(cb: CallbackQuery):
     carts[cb.from_user.id] = {}
     draft.pop(cb.from_user.id, None)
     await cb.message.edit_text("❌ Замовлення скасовано.")
     await cb.answer()
-
 
 @dp.callback_query(F.data == "confirm")
 async def confirm(cb: CallbackQuery):
@@ -526,19 +496,17 @@ async def confirm(cb: CallbackQuery):
         return
 
     order_id = str(res.get("orderId", ""))
-    await cb.message.edit_text(
-        f"🎉 Дякуємо! Замовлення прийнято.\nНомер: #{order_id}\nМенеджер скоро зв’яжеться."
-    )
+    await cb.message.edit_text(f"🎉 Дякуємо! Замовлення прийнято.\nНомер: #{order_id}\nМенеджер скоро зв’яжеться.")
 
     mgr_text = [
         f"🆕 НОВЕ ЗАМОВЛЕННЯ #{order_id}",
-        f"Ім’я: {d.get('name', '')}",
-        f"Телефон: {d.get('phone', '')}",
+        f"Ім’я: {d.get('name','')}",
+        f"Телефон: {d.get('phone','')}",
         f"Telegram: @{cb.from_user.username}" if cb.from_user.username else f"Telegram ID: {user_id}",
-        f"Тип: {d.get('deliveryType', '')}",
-        f"Адреса/самовивіз: {d.get('address', '-')}",
-        f"Дата/час: {d.get('datetime', '')}",
-        f"Коментар: {d.get('comment', '-') or '-'}",
+        f"Тип: {d.get('deliveryType','')}",
+        f"Адреса/самовивіз: {d.get('address','-')}",
+        f"Дата/час: {d.get('datetime','')}",
+        f"Коментар: {d.get('comment','-') or '-'}",
         "",
         "Склад:"
     ]
@@ -555,13 +523,12 @@ async def confirm(cb: CallbackQuery):
 
     carts[user_id] = {}
     draft.pop(user_id, None)
-    await cb.answer("Готово ✅")
 
+    await cb.answer("Готово ✅")
 
 @dp.callback_query(F.data.startswith("st:"))
 async def set_status(cb: CallbackQuery):
-    # Manager button presses: safest is to require ADMIN_IDS.
-    if ADMIN_IDS and cb.from_user.id not in ADMIN_IDS:
+    if ADMIN_IDS and cb.from_user.id not in ADMIN_IDS and cb.from_user.id != MANAGER_CHAT_ID:
         await cb.answer("Немає доступу", show_alert=True)
         return
 
@@ -579,71 +546,47 @@ async def set_status(cb: CallbackQuery):
     else:
         await cb.answer("Помилка оновлення статусу", show_alert=True)
 
+# =========================
+# Aiohttp app + Polling runner
+# =========================
+_polling_task: Optional[asyncio.Task] = None
 
-# =========================
-# Webhook server (aiohttp)
-# =========================
 async def on_startup(app: web.Application):
-    webhook_url = f"{WEBHOOK_BASE}{WEBHOOK_PATH}"
-    try:
-        # Important: do not crash the whole service if Telegram rejects it temporarily
-        await bot.delete_webhook(drop_pending_updates=True)
-        await bot.set_webhook(webhook_url)
-        print("✅ Webhook set to:", webhook_url)
-    except Exception as e:
-        print("❌ Webhook setup failed:", repr(e))
-        # Keep service alive anyway (Render healthcheck + logs will work)
+    global _polling_task
 
-
-async def on_shutdown(app: web.Application):
+    # на всякий випадок — вимикаємо webhook, бо ми на polling
     try:
         await bot.delete_webhook(drop_pending_updates=True)
     except Exception:
         pass
+
+    async def runner():
+        await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
+
+    _polling_task = asyncio.create_task(runner())
+    print("✅ Bot polling started")
+
+async def on_shutdown(app: web.Application):
+    global _polling_task
+    if _polling_task:
+        _polling_task.cancel()
+        try:
+            await _polling_task
+        except Exception:
+            pass
     await bot.session.close()
 
-
-async def handle_webhook(request: web.Request):
-    # Always return 200 to Telegram, never 500
-    try:
-        if request.method != "POST":
-            return web.Response(text="ok")
-
-        try:
-            update = await request.json()
-        except Exception as e:
-            body = await request.text()
-            print("Webhook JSON parse error:", repr(e), "Body head:", body[:200])
-            return web.Response(text="ok")
-
-        try:
-            await dp.feed_raw_update(bot, update)
-        except Exception as e:
-            print("dp.feed_raw_update error:", repr(e))
-
-        return web.Response(text="ok")
-
-    except Exception as e:
-        print("Webhook handler error:", repr(e))
-        return web.Response(text="ok")
-
+async def health(_request: web.Request):
+    return web.Response(text="ok")
 
 def build_app() -> web.Application:
     app = web.Application()
-
-    async def health(_request: web.Request):
-        return web.Response(text="ok")
-
     app.router.add_get("/", health)
-    app.router.add_post(WEBHOOK_PATH, handle_webhook)
-
     app.on_startup.append(on_startup)
     app.on_shutdown.append(on_shutdown)
     return app
 
-
 if __name__ == "__main__":
-    print(f"🚀 Starting on 0.0.0.0:{PORT} | webhook: {WEBHOOK_BASE}{WEBHOOK_PATH}")
     web.run_app(build_app(), host="0.0.0.0", port=PORT)
 
 
