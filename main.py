@@ -179,6 +179,22 @@ async def gs_update_status(session: ClientSession, order_id: str, status: str) -
 bot = Bot(BOT_TOKEN)
 dp = Dispatcher()
 
+from aiogram.filters import Command
+
+@dp.message(Command("fileid"))
+async def fileid_help(m: Message):
+    if ADMIN_IDS and m.from_user.id not in ADMIN_IDS:
+        return
+    await m.answer("Надішли мені фото як повідомлення (не файлом). Я відповім file_id.")
+
+@dp.message(F.photo)
+async def fileid_photo(m: Message):
+    if ADMIN_IDS and m.from_user.id not in ADMIN_IDS:
+        return
+
+    # Найкраща якість — останній елемент
+    photo = m.photo[-1]
+    await m.answer(f"✅ file_id:\n`{photo.file_id}`", parse_mode="Markdown")
 
 @dp.message(CommandStart())
 async def start(m: Message):
@@ -539,4 +555,5 @@ def build_app():
 if __name__ == "__main__":
 
     web.run_app(build_app(), host="0.0.0.0", port=PORT)
+
 
