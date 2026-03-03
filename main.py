@@ -591,7 +591,12 @@ async def set_status(cb: CallbackQuery):
 # =========================
 async def on_startup(app: web.Application):
     webhook_url = f"{WEBHOOK_BASE}{WEBHOOK_PATH}"
+
+    # ВАЖЛИВО: перед встановленням завжди чистимо попередній webhook
+    await bot.delete_webhook(drop_pending_updates=True)
+
     await bot.set_webhook(webhook_url)
+    print("✅ Webhook set to:", webhook_url)
 
 
 async def on_shutdown(app: web.Application):
@@ -621,14 +626,18 @@ async def handle_webhook(request: web.Request):
 
 def build_app():
     app = web.Application()
+
+    # healthcheck
+    async def health(_request):
+        return web.Response(text="ok")
+
+    app.router.add_get("/", health)
     app.router.add_post(WEBHOOK_PATH, handle_webhook)
+
     app.on_startup.append(on_startup)
     app.on_shutdown.append(on_shutdown)
     return app
 
-
-if __name__ == "__main__":
-    web.run_app(build_app(), host="0.0.0.0", port=PORT)
 
 
 
