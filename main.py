@@ -198,6 +198,22 @@ async def safe_edit(cb: CallbackQuery, text: str, reply_markup=None):
 bot = Bot(BOT_TOKEN)
 dp = Dispatcher()
 
+from aiogram import BaseMiddleware
+from aiogram.types import TelegramObject
+
+class CrashGuardMiddleware(BaseMiddleware):
+    async def __call__(self, handler, event: TelegramObject, data: dict):
+        try:
+            return await handler(event, data)
+        except Exception as e:
+            print("🔥 UNHANDLED ERROR:", repr(e))
+            # важливо: не валимо процес
+            return
+
+dp.update.middleware(CrashGuardMiddleware())
+
+
+
 # ---------- admin file_id ----------
 @dp.message(Command("fileid"))
 async def fileid_help(m: Message):
@@ -292,7 +308,9 @@ async def cat(cb: CallbackQuery):
 async def prod(cb: CallbackQuery):
     sku = cb.data.split(":", 1)[1]
     item = find_item_by_sku(sku)
+
     if not item:
+        # show_alert=True щоб користувач точно побачив
         await cb.answer("Товар не знайдено", show_alert=True)
         return
 
@@ -302,17 +320,44 @@ async def prod(cb: CallbackQuery):
         "Додати в кошик?"
     )
 
-    # показуємо окремим повідомленням (ок)
-    if item.get("photo"):
-        try:
-            await cb.message.answer_photo(photo=item["photo"], caption=text, reply_markup=product_kb(sku))
-        except Exception as e:
-            print("answer_photo failed:", repr(e))
-            await cb.message.answer(text + "\n\n⚠️ Фото недоступне. Перевірте file_id для цього бота.", reply_markup=product_kb(sku))
-    else:
-        await cb.message.answer(text, reply_markup=product_kb(sku))
+    try:
+        # ВАЖЛИВО: не редагуємо поточне повідомлення — шлемо нове
+        photo_id = (item.get("photo") or "").strip()
 
-    await cb.answer()
+        if photo_id:
+            try:
+                await cb.message.answer_photo(
+                    photo=photo_id,
+                    caption=text,
+                    reply_markup=product_kb(sku)
+                )
+            except Exception as e:
+                # типово: wrong file identifier / file not found / etc.
+                print("answer_photo failed:", repr(e))
+                await cb.message.answer(
+                    text + "\n\n⚠️ Фото тимчасово недоступне (file_id).",
+                    reply_markup=product_kb(sku)
+                )
+        else:
+            await cb.message.answer(text, reply_markup=product_kb(sku))
+
+    except Exception as e:
+        # страховка на все інше (щоб потік не падав)
+        print("prod handler failed:", repr(e))
+        try:
+            await cb.message.answer(
+                "⚠️ Сталась технічна помилка при показі товару. Спробуйте ще раз.",
+                reply_markup=product_kb(sku)
+            )
+        except Exception:
+            pass
+
+    finally:
+        # ГОЛОВНЕ: щоб Telegram не крутив “loading…”
+        try:
+            await cb.answer()
+        except Exception:
+            pass
 
 @dp.callback_query(F.data.startswith("add:"))
 async def add(cb: CallbackQuery):
@@ -612,6 +657,7 @@ def build_app():
 
 if __name__ == "__main__":
     web.run_app(build_app(), host="0.0.0.0", port=PORT)
+
 
 
 
