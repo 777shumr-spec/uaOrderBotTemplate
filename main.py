@@ -20,7 +20,6 @@ from aiogram.filters import CommandStart, Command
 from aiogram import BaseMiddleware
 from aiogram.types import TelegramObject
 
-# ✅ правильна сесія aiogram з таймаутом
 from aiogram.client.session.aiohttp import AiohttpSession
 
 
@@ -97,9 +96,8 @@ fileid_mode: Dict[int, bool] = {}
 
 
 # =========================
-# Global stability settings
+# Queue (Webhook -> worker)
 # =========================
-UPDATE_PROCESS_TIMEOUT_SEC = 25
 UPDATE_QUEUE_MAX = 2000
 update_queue: asyncio.Queue = asyncio.Queue(maxsize=UPDATE_QUEUE_MAX)
 
@@ -195,7 +193,6 @@ def now_str() -> str:
 
 
 def norm_text(s: Optional[str]) -> str:
-    # нормалізуємо пробіли + прибираємо невидимі штуки
     if not s:
         return ""
     return " ".join(str(s).replace("\u00a0", " ").split()).strip()
@@ -287,7 +284,7 @@ def lost_session_text() -> str:
 
 
 # =========================
-# Telegram API wrappers (без wait_for)
+# Telegram safe wrappers
 # =========================
 async def tg_call(coro, what: str = "tg_call"):
     try:
@@ -383,7 +380,8 @@ async def debug_state(m: Message):
     uid = m.from_user.id
     await safe_send(
         m,
-        f"DEBUG boot_id={boot_id} pid={process_id}\nuser={uid}\ndraft={draft.get(uid)}\ncart={carts.get(uid)}\nqueue={update_queue.qsize()}"
+        f"DEBUG boot_id={boot_id} pid={process_id}\nuser={uid}\n"
+        f"draft={draft.get(uid)}\ncart={carts.get(uid)}\nqueue={update_queue.qsize()}"
     )
 
 
@@ -451,36 +449,37 @@ async def start(m: Message):
     await safe_send(m, welcome_text, reply_markup=main_menu_kb())
 
 
-# ✅ ВАЖЛИВО: робимо кнопки НЕ по точній рівності, а по змісту
-@dp.message(F.text.contains("Зробити замовлення"))
-@dp.message(F.text.contains("Каталог"))
-@dp.message(F.text.contains("Меню"))
-async def show_catalog(m: Message):
+# ✅ Меню: тільки точні кнопки (щоб не красти кроки оформлення)
+@dp.message(F.text)
+async def menu_router(m: Message):
     txt = norm_text(m.text)
-    log.info("📩 menu click user=%s text=%r", m.from_user.id, txt)
-    await safe_send(m, "Оберіть категорію:", reply_markup=categories_kb())
 
+    # якщо користувач в активному флоу — меню не чіпаємо
+    if m.from_user and m.from_user.id in draft:
+        return
 
-@dp.message(F.text.contains("Доставка"))
-@dp.message(F.text.contains("оплата"))
-async def delivery(m: Message):
-    await safe_send(
-        m,
-        "🚚 Доставка та оплата:\n"
-        "• Доставка по місту\n"
-        "• Самовивіз\n"
-        "Оплата: готівка/переказ (на старті)."
-    )
+    if txt in ("🛒 Зробити замовлення", "📦 Каталог / Меню"):
+        log.info("📩 menu click user=%s text=%r", m.from_user.id, txt)
+        await safe_send(m, "Оберіть категорію:", reply_markup=categories_kb())
+        return
 
+    if txt == "🚚 Доставка та оплата":
+        await safe_send(
+            m,
+            "🚚 Доставка та оплата:\n"
+            "• Доставка по місту\n"
+            "• Самовивіз\n"
+            "Оплата: готівка/переказ (на старті)."
+        )
+        return
 
-@dp.message(F.text.contains("Контакти"))
-async def contacts(m: Message):
-    await safe_send(m, "☎️ Контакти:\nМенеджер: @ruslanshum\nТел: +380973080330")
+    if txt == "☎️ Контакти":
+        await safe_send(m, "☎️ Контакти:\nМенеджер: @ruslanshum\nТел: +380973080330")
+        return
 
-
-@dp.message(F.text.contains("Мої замовлення"))
-async def my_orders_stub(m: Message):
-    await safe_send(m, "🧾 Поки що в демо показ 'Мої замовлення' буде на наступному кроці.")
+    if txt == "🧾 Мої замовлення":
+        await safe_send(m, "🧾 Поки що в демо показ 'Мої замовлення' буде на наступному кроці.")
+        return
 
 
 @dp.callback_query(F.data == "cats")
@@ -613,7 +612,7 @@ async def flow_contact(m: Message):
     await safe_send(m, "Оберіть тип отримання:", reply_markup=kb)
 
 
-# FLOW: text
+# FLOW: text (оформлення)
 @dp.message(F.text)
 async def flow(m: Message):
     user_id = m.from_user.id
@@ -654,12 +653,14 @@ async def flow(m: Message):
             await save_state("delivery_pickup")
             await safe_send(m, "🕒 Вкажіть дату/час (наприклад: завтра 14:00):", reply_markup=main_menu_kb())
             return
+
         if "Доставка" in text:
             draft[user_id]["deliveryType"] = "DELIVERY"
             draft[user_id]["step"] = "address"
             await save_state("delivery_delivery")
             await safe_send(m, "🏠 Введіть адресу доставки:", reply_markup=main_menu_kb())
             return
+
         await safe_send(m, "Будь ласка, натисніть кнопку: 🚚 Доставка або 🏃 Самовивіз")
         return
 
@@ -817,30 +818,23 @@ async def set_status(cb: CallbackQuery):
 
 
 # =========================
-# Webhook worker (QUEUE)
+# Worker: process updates sequentially (NO wait_for cancellation)
 # =========================
-async def _process_update_with_timeout(update: dict):
-    try:
-        await asyncio.wait_for(dp.feed_raw_update(bot, update), timeout=UPDATE_PROCESS_TIMEOUT_SEC)
-    except asyncio.TimeoutError:
-        log.error("⏱ feed_raw_update TIMEOUT (%ss). Update skipped.", UPDATE_PROCESS_TIMEOUT_SEC)
-    except Exception as e:
-        log.error("🔥 feed_raw_update failed: %r", e)
-        log.error(traceback.format_exc())
-
-
 async def update_worker():
     log.info("✅ update_worker started boot_id=%s pid=%s", boot_id, process_id)
     while True:
         upd = await update_queue.get()
         try:
-            await _process_update_with_timeout(upd)
+            await dp.feed_raw_update(bot, upd)
+        except Exception as e:
+            log.error("🔥 feed_raw_update failed: %r", e)
+            log.error(traceback.format_exc())
         finally:
             update_queue.task_done()
 
 
 # =========================
-# Webhook server (aiohttp)
+# Webhook server lifecycle
 # =========================
 async def app_lifecycle(app: web.Application):
     global gs_http
@@ -864,8 +858,7 @@ async def app_lifecycle(app: web.Application):
     else:
         log.warning("WEBHOOK_BASE is empty. Webhook will NOT be set.")
 
-    # старт
-    yield
+    yield  # RUNNING
 
     # shutdown
     try:
@@ -923,6 +916,7 @@ def build_app():
 
 if __name__ == "__main__":
     web.run_app(build_app(), host="0.0.0.0", port=PORT)
+
 
 
 
