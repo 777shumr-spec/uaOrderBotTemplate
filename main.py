@@ -50,6 +50,10 @@ WEBHOOK_BASE = (os.getenv("WEBHOOK_BASE", "").strip() or os.getenv("RENDER_EXTER
 WEBHOOK_PATH = os.getenv("WEBHOOK_PATH", "/webhook").strip()
 PORT = int((os.getenv("PORT", "10000") or "10000"))
 
+# IMPORTANT:
+# drop pending updates ONLY when you intentionally want to clear the backlog
+DROP_PENDING_UPDATES = os.getenv("DROP_PENDING_UPDATES", "0").strip() in ("1", "true", "True", "YES", "yes")
+
 WEBHOOK_BASE = WEBHOOK_BASE.rstrip("/") if WEBHOOK_BASE else ""
 
 if not BOT_TOKEN:
@@ -101,7 +105,6 @@ fileid_mode: Dict[int, bool] = {}
 UPDATE_QUEUE_MAX = 2000
 update_queue: asyncio.Queue = asyncio.Queue(maxsize=UPDATE_QUEUE_MAX)
 
-# concurrency controls
 WORKERS = int(os.getenv("WORKERS", "4"))
 MAX_INFLIGHT = int(os.getenv("MAX_INFLIGHT", "50"))
 inflight_sem = asyncio.Semaphore(MAX_INFLIGHT)
@@ -120,7 +123,6 @@ async def _get_user_lock(uid: int) -> asyncio.Lock:
 
 
 def _extract_uid_from_update(upd: Dict[str, Any]) -> int:
-    # minimal & safe extraction for per-user ordering
     try:
         if "message" in upd and upd["message"] and "from" in upd["message"]:
             return int(upd["message"]["from"]["id"])
@@ -420,7 +422,8 @@ async def debug_state(m: Message):
         m,
         f"DEBUG boot_id={boot_id} pid={process_id}\nuser={uid}\n"
         f"draft={draft.get(uid)}\ncart={carts.get(uid)}\nqueue={update_queue.qsize()}\n"
-        f"workers={WORKERS} inflight_limit={MAX_INFLIGHT}"
+        f"workers={WORKERS} inflight_limit={MAX_INFLIGHT}\n"
+        f"drop_pending={DROP_PENDING_UPDATES}"
     )
 
 
@@ -488,9 +491,6 @@ async def start(m: Message):
     await safe_send(m, welcome_text, reply_markup=main_menu_kb())
 
 
-# -------------------------
-# MENU BUTTONS (точно)
-# -------------------------
 async def _warn_in_flow(m: Message) -> bool:
     if in_flow(m.from_user.id):
         await safe_send(m, "⚠️ Ви зараз оформлюєте замовлення. Будь ласка, завершіть крок або введіть /reset щоб почати з нуля.")
@@ -533,9 +533,6 @@ async def my_orders_stub(m: Message):
     await safe_send(m, "🧾 Поки що в демо показ 'Мої замовлення' буде на наступному кроці.")
 
 
-# -------------------------
-# Inline navigation
-# -------------------------
 @dp.callback_query(F.data == "cats")
 async def cats(cb: CallbackQuery):
     await safe_edit(cb, "Оберіть категорію:", reply_markup=categories_kb())
@@ -641,7 +638,6 @@ async def checkout(cb: CallbackQuery):
     await tg_call(cb.answer(), what="cb.answer(checkout)")
 
 
-# --- phone via contact ---
 @dp.message(F.contact)
 async def flow_contact(m: Message):
     user_id = m.from_user.id
@@ -667,7 +663,6 @@ async def flow_contact(m: Message):
     await safe_send(m, "Оберіть тип отримання:", reply_markup=kb)
 
 
-# FLOW: text (оформлення)
 @dp.message(F.text)
 async def flow(m: Message):
     user_id = m.from_user.id
@@ -789,7 +784,6 @@ async def confirm(cb: CallbackQuery):
         await tg_call(cb.answer("Немає активного замовлення", show_alert=True), what="cb.answer(confirm_noactive)")
         return
 
-    # анти-дубль натискання
     if draft[user_id].get("_confirming"):
         await tg_call(cb.answer("⏳ Уже зберігаю...", show_alert=False), what="cb.answer(confirm_busy)")
         return
@@ -828,7 +822,6 @@ async def confirm(cb: CallbackQuery):
     res = await gs_create_order(order_payload)
 
     if not res.get("ok"):
-        # прибираємо флаг, щоб користувач міг повторити
         draft[user_id]["_confirming"] = False
         await save_state("confirm_gs_error")
         await tg_call(cb.message.answer(f"❌ Помилка збереження замовлення.\n{res}"), what="send_gs_error")
@@ -886,7 +879,7 @@ async def set_status(cb: CallbackQuery):
 
 
 # =========================
-# Workers: process updates (parallel per user, ordered within user)
+# Workers
 # =========================
 async def _handle_one_update(upd: Dict[str, Any]):
     uid = _extract_uid_from_update(upd)
@@ -914,11 +907,11 @@ async def update_worker(worker_id: int):
 
 
 # =========================
-# Webhook server lifecycle (armored)
+# Webhook server lifecycle
 # =========================
 async def app_lifecycle(app: web.Application):
     global gs_http
-    log.info("🚀 BOOT boot_id=%s pid=%s", boot_id, process_id)
+    log.info("🚀 BOOT boot_id=%s pid=%s drop_pending=%s", boot_id, process_id, DROP_PENDING_UPDATES)
 
     worker_tasks: List[asyncio.Task] = []
 
@@ -928,7 +921,6 @@ async def app_lifecycle(app: web.Application):
         gs_timeout = ClientTimeout(total=25, connect=10, sock_connect=10, sock_read=25)
         gs_http = ClientSession(timeout=gs_timeout)
 
-        # start workers
         for i in range(WORKERS):
             t = asyncio.create_task(update_worker(i + 1))
             worker_tasks.append(t)
@@ -937,8 +929,16 @@ async def app_lifecycle(app: web.Application):
         if WEBHOOK_BASE:
             webhook_url = f"{WEBHOOK_BASE}{WEBHOOK_PATH}"
             try:
-                await bot.delete_webhook(drop_pending_updates=True)
-                await bot.set_webhook(webhook_url, allowed_updates=["message", "callback_query"])
+                # IMPORTANT:
+                # Only drop pending updates if you explicitly want to clear backlog.
+                if DROP_PENDING_UPDATES:
+                    await bot.delete_webhook(drop_pending_updates=True)
+
+                await bot.set_webhook(
+                    webhook_url,
+                    allowed_updates=["message", "callback_query"],
+                    max_connections=40
+                )
                 log.info("✅ Webhook set to: %s", webhook_url)
             except Exception as e:
                 log.exception("❌ set_webhook failed: %r", e)
@@ -948,13 +948,11 @@ async def app_lifecycle(app: web.Application):
         yield  # RUNNING
 
     finally:
-        # shutdown (always)
-        try:
-            await bot.delete_webhook(drop_pending_updates=True)
-        except Exception:
-            pass
+        # IMPORTANT:
+        # Do NOT delete webhook on shutdown.
+        # During Render rolling restart / deploy it can DROP user messages (your exact symptom).
+        # Just stop workers and close sessions.
 
-        # stop workers
         for t in worker_tasks:
             t.cancel()
         for t in worker_tasks:
@@ -999,7 +997,6 @@ def build_app():
         return web.Response(text="ok")
 
     async def healthz(_request):
-        # useful for Render health check
         return web.json_response({
             "ok": True,
             "boot_id": boot_id,
@@ -1007,6 +1004,7 @@ def build_app():
             "queue": update_queue.qsize(),
             "workers": WORKERS,
             "inflight_limit": MAX_INFLIGHT,
+            "drop_pending": DROP_PENDING_UPDATES,
         })
 
     app.router.add_get("/", health)
@@ -1019,6 +1017,7 @@ def build_app():
 
 if __name__ == "__main__":
     web.run_app(build_app(), host="0.0.0.0", port=PORT)
+
 
 
 
