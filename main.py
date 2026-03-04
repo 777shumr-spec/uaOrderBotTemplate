@@ -5,6 +5,8 @@ import asyncio
 import traceback
 from datetime import datetime
 from typing import Dict, Any, List, Optional
+import uuid
+import time
 
 from aiohttp import web, ClientSession, ClientTimeout
 
@@ -56,7 +58,7 @@ if MANAGER_CHAT_ID == 0:
     raise RuntimeError("MANAGER_CHAT_ID is required")
 
 # =========================
-# Catalog (file_id під твого нового бота)
+# Catalog
 # =========================
 CATALOG = {
     "Десерти": [
@@ -80,7 +82,7 @@ CATALOG = {
 }
 
 # =========================
-# State (RAM) — може скидатися при рестарті
+# State (RAM)
 # =========================
 carts: Dict[int, Dict[str, int]] = {}
 draft: Dict[int, Dict[str, Any]] = {}
@@ -89,11 +91,84 @@ fileid_mode: Dict[int, bool] = {}
 # =========================
 # Global stability settings
 # =========================
-TG_CALL_TIMEOUT_SEC = 12          # таймаут на конкретний виклик Telegram API
-UPDATE_PROCESS_TIMEOUT_SEC = 20   # таймаут на обробку одного апдейту (флоу + відправка)
-UPDATE_QUEUE_MAX = 2000           # щоб не з'їсти RAM якщо Telegram "поливає"
+TG_CALL_TIMEOUT_SEC = 12
+UPDATE_PROCESS_TIMEOUT_SEC = 25
+UPDATE_QUEUE_MAX = 2000
 
 update_queue: asyncio.Queue = asyncio.Queue(maxsize=UPDATE_QUEUE_MAX)
+
+# =========================
+# Persistent state (важливо!)
+# =========================
+STATE_FILE = os.getenv("STATE_FILE", "state.json")
+state_lock = asyncio.Lock()
+boot_id = os.getenv("BOOT_ID", "") or str(uuid.uuid4())[:8]
+process_id = os.getpid()
+boot_ts = int(time.time())
+
+def _serialize_state() -> Dict[str, Any]:
+    # keys as strings for json
+    return {
+        "meta": {"boot_id": boot_id, "pid": process_id, "boot_ts": boot_ts},
+        "carts": {str(uid): cart for uid, cart in carts.items()},
+        "draft": {str(uid): d for uid, d in draft.items()},
+        "fileid_mode": {str(uid): bool(v) for uid, v in fileid_mode.items()},
+    }
+
+def _restore_state(data: Dict[str, Any]):
+    carts.clear()
+    draft.clear()
+    fileid_mode.clear()
+
+    carts_data = data.get("carts", {}) or {}
+    draft_data = data.get("draft", {}) or {}
+    fileid_data = data.get("fileid_mode", {}) or {}
+
+    for k, v in carts_data.items():
+        try:
+            carts[int(k)] = {str(sku): int(qty) for sku, qty in (v or {}).items()}
+        except Exception:
+            pass
+
+    for k, v in draft_data.items():
+        try:
+            draft[int(k)] = v if isinstance(v, dict) else {}
+        except Exception:
+            pass
+
+    for k, v in fileid_data.items():
+        try:
+            fileid_mode[int(k)] = bool(v)
+        except Exception:
+            pass
+
+async def save_state(reason: str = ""):
+    async with state_lock:
+        payload = _serialize_state()
+        try:
+            # write atomically
+            tmp = STATE_FILE + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(payload, f, ensure_ascii=False)
+            os.replace(tmp, STATE_FILE)
+            log.info("💾 state saved (%s) carts=%d draft=%d", reason, len(carts), len(draft))
+        except Exception as e:
+            log.warning("💾 state save failed: %r", e)
+
+async def load_state():
+    async with state_lock:
+        if not os.path.exists(STATE_FILE):
+            log.info("💾 state file not found -> start fresh")
+            return
+        try:
+            with open(STATE_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            _restore_state(data)
+            meta = (data.get("meta") or {})
+            log.info("💾 state loaded carts=%d draft=%d (prev boot_id=%s pid=%s)",
+                     len(carts), len(draft), meta.get("boot_id"), meta.get("pid"))
+        except Exception as e:
+            log.warning("💾 state load failed: %r", e)
 
 # =========================
 # Helpers
@@ -178,11 +253,6 @@ def lost_session_text() -> str:
     )
 
 async def tg_call(coro, what: str = "tg_call"):
-    """
-    Обгортка для будь-якого Telegram API виклику:
-    - дає таймаут
-    - логування якщо зависло/впало
-    """
     try:
         return await asyncio.wait_for(coro, timeout=TG_CALL_TIMEOUT_SEC)
     except asyncio.TimeoutError:
@@ -260,11 +330,20 @@ async def debug_state(m: Message):
     uid = m.from_user.id
     d = draft.get(uid)
     c = carts.get(uid)
-    await safe_send(m, f"DEBUG\nuser={uid}\ndraft={d}\ncart={c}\nqueue={update_queue.qsize()}")
+    await safe_send(m, f"DEBUG boot_id={boot_id} pid={process_id}\nuser={uid}\ndraft={d}\ncart={c}\nqueue={update_queue.qsize()}")
 
 @dp.message(Command("ping"))
 async def ping(m: Message):
-    await safe_send(m, "pong ✅")
+    await safe_send(m, f"pong ✅ boot_id={boot_id} pid={process_id}")
+
+@dp.message(Command("reset"))
+async def reset(m: Message):
+    # корисно якщо користувач застряг
+    uid = m.from_user.id
+    carts.pop(uid, None)
+    draft.pop(uid, None)
+    await save_state("reset")
+    await safe_send(m, "✅ Стан очищено. Можете почати заново.", reply_markup=main_menu_kb())
 
 # =========================
 # Admin file_id
@@ -274,6 +353,7 @@ async def fileid_help(m: Message):
     if ADMIN_IDS and m.from_user.id not in ADMIN_IDS:
         return
     fileid_mode[m.from_user.id] = True
+    await save_state("fileid_on")
     await safe_send(
         m,
         "✅ Режим file_id увімкнено.\n"
@@ -286,6 +366,7 @@ async def fileid_off(m: Message):
     if ADMIN_IDS and m.from_user.id not in ADMIN_IDS:
         return
     fileid_mode[m.from_user.id] = False
+    await save_state("fileid_off")
     await safe_send(m, "✅ Режим file_id вимкнено.")
 
 @dp.message(F.photo)
@@ -374,17 +455,10 @@ async def prod(cb: CallbackQuery):
 
     photo_id = (item.get("photo") or "").strip()
     if photo_id:
-        try:
-            await tg_call(
-                cb.message.answer_photo(photo=photo_id, caption=text, reply_markup=product_kb(sku)),
-                what="answer_photo"
-            )
-        except Exception as e:
-            log.warning("answer_photo failed (sku=%s): %r", sku, e)
-            await tg_call(
-                cb.message.answer(text + "\n\n⚠️ Фото тимчасово недоступне.", reply_markup=product_kb(sku)),
-                what="answer_text_no_photo"
-            )
+        await tg_call(
+            cb.message.answer_photo(photo=photo_id, caption=text, reply_markup=product_kb(sku)),
+            what="answer_photo"
+        )
     else:
         await tg_call(cb.message.answer(text, reply_markup=product_kb(sku)), what="answer_product_text")
 
@@ -395,6 +469,9 @@ async def add(cb: CallbackQuery):
     sku = cb.data.split(":", 1)[1]
     carts.setdefault(cb.from_user.id, {})
     carts[cb.from_user.id][sku] = carts[cb.from_user.id].get(sku, 0) + 1
+    log.info("🛒 add user=%s sku=%s qty=%s cart=%s",
+             cb.from_user.id, sku, carts[cb.from_user.id][sku], carts[cb.from_user.id])
+    await save_state("add")
     await tg_call(cb.answer("Додано ✅"), what="cb.answer(add)")
 
 @dp.callback_query(F.data.startswith("rem:"))
@@ -404,6 +481,8 @@ async def rem(cb: CallbackQuery):
         carts[cb.from_user.id][sku] -= 1
         if carts[cb.from_user.id][sku] <= 0:
             del carts[cb.from_user.id][sku]
+        log.info("🛒 rem user=%s sku=%s cart=%s", cb.from_user.id, sku, carts.get(cb.from_user.id, {}))
+        await save_state("rem")
         await tg_call(cb.answer("Забрано ✅"), what="cb.answer(rem)")
     else:
         await tg_call(cb.answer("У кошику немає", show_alert=False), what="cb.answer(rem_none)")
@@ -417,6 +496,7 @@ async def cart(cb: CallbackQuery):
 async def clear(cb: CallbackQuery):
     carts[cb.from_user.id] = {}
     draft.pop(cb.from_user.id, None)
+    await save_state("clear")
     await safe_edit(cb, "🧺 Кошик очищено.", reply_markup=categories_kb())
     await tg_call(cb.answer(), what="cb.answer(clear)")
 
@@ -426,6 +506,7 @@ async def checkout(cb: CallbackQuery):
         await tg_call(cb.answer("Кошик порожній", show_alert=True), what="cb.answer(checkout_empty)")
         return
     draft[cb.from_user.id] = {"step": "name"}
+    await save_state("checkout")
     log.info("checkout -> step=name user=%s", cb.from_user.id)
     await tg_call(cb.message.answer("✍️ Введіть ваше ім’я:"), what="ask_name")
     await tg_call(cb.answer(), what="cb.answer(checkout)")
@@ -446,6 +527,8 @@ async def flow_contact(m: Message):
     phone = (m.contact.phone_number or "").strip()
     draft[user_id]["phone"] = phone
     draft[user_id]["step"] = "deliveryType"
+    await save_state("phone_contact")
+
     log.info("flow_contact -> step=deliveryType user=%s phone=%s", user_id, phone)
 
     kb = ReplyKeyboardMarkup(
@@ -468,6 +551,7 @@ async def flow(m: Message):
     if step == "name":
         draft[user_id]["name"] = text
         draft[user_id]["step"] = "phone"
+        await save_state("name")
         kb = ReplyKeyboardMarkup(
             keyboard=[[KeyboardButton(text="📱 Поділитися контактом", request_contact=True)]],
             resize_keyboard=True, one_time_keyboard=True
@@ -478,6 +562,7 @@ async def flow(m: Message):
     if step == "phone":
         draft[user_id]["phone"] = text
         draft[user_id]["step"] = "deliveryType"
+        await save_state("phone_text")
         kb = ReplyKeyboardMarkup(
             keyboard=[[KeyboardButton(text="🚚 Доставка"), KeyboardButton(text="🏃 Самовивіз")]],
             resize_keyboard=True, one_time_keyboard=True
@@ -490,11 +575,13 @@ async def flow(m: Message):
             draft[user_id]["deliveryType"] = "PICKUP"
             draft[user_id]["address"] = "-"
             draft[user_id]["step"] = "datetime"
+            await save_state("delivery_pickup")
             await safe_send(m, "🕒 Вкажіть дату/час (наприклад: завтра 14:00):", reply_markup=main_menu_kb())
             return
         if "Доставка" in text:
             draft[user_id]["deliveryType"] = "DELIVERY"
             draft[user_id]["step"] = "address"
+            await save_state("delivery_delivery")
             await safe_send(m, "🏠 Введіть адресу доставки:", reply_markup=main_menu_kb())
             return
         await safe_send(m, "Будь ласка, натисніть кнопку: 🚚 Доставка або 🏃 Самовивіз")
@@ -503,19 +590,19 @@ async def flow(m: Message):
     if step == "address":
         draft[user_id]["address"] = text
         draft[user_id]["step"] = "datetime"
+        await save_state("address")
         await safe_send(m, "🕒 Вкажіть дату/час (наприклад: сьогодні 19:30):")
         return
 
     if step == "datetime":
         draft[user_id]["datetime"] = text
         draft[user_id]["step"] = "comment"
+        await save_state("datetime")
         await safe_send(m, "💬 Коментар (якщо НП — місто, відділення, ПІБ, телефон):")
         return
 
     if step == "comment":
-        comment = text
-        if comment == "-":
-            comment = ""
+        comment = "" if text == "-" else text
         draft[user_id]["comment"] = comment
 
         items: List[Dict[str, Any]] = []
@@ -546,6 +633,7 @@ async def flow(m: Message):
         draft[user_id]["items"] = items
         draft[user_id]["total"] = total
         draft[user_id]["step"] = "confirm_wait"
+        await save_state("comment_confirm_wait")
 
         await safe_send(m, "\n".join(summary), reply_markup=kb)
         return
@@ -554,6 +642,7 @@ async def flow(m: Message):
 async def cancel(cb: CallbackQuery):
     carts[cb.from_user.id] = {}
     draft.pop(cb.from_user.id, None)
+    await save_state("cancel")
     await safe_edit(cb, "❌ Замовлення скасовано.")
     await tg_call(cb.answer(), what="cb.answer(cancel)")
 
@@ -621,20 +710,18 @@ async def confirm(cb: CallbackQuery):
     mgr_text.append(f"\nРазом: {total} {CURRENCY}")
     mgr_text.append(f"Час: {now_str()}")
 
-    try:
-        await tg_call(
-            bot.send_message(
-                chat_id=MANAGER_CHAT_ID,
-                text="\n".join(mgr_text),
-                reply_markup=manager_status_kb(order_id, str(user_id))
-            ),
-            what="send_to_manager"
-        )
-    except Exception as e:
-        log.warning("send_message to manager failed: %r", e)
+    await tg_call(
+        bot.send_message(
+            chat_id=MANAGER_CHAT_ID,
+            text="\n".join(mgr_text),
+            reply_markup=manager_status_kb(order_id, str(user_id))
+        ),
+        what="send_to_manager"
+    )
 
     carts[user_id] = {}
     draft.pop(user_id, None)
+    await save_state("confirm_done")
 
 @dp.callback_query(F.data.startswith("st:"))
 async def set_status(cb: CallbackQuery):
@@ -655,7 +742,7 @@ async def set_status(cb: CallbackQuery):
         await tg_call(cb.answer("Помилка оновлення статусу", show_alert=True), what="cb.answer(st_err)")
 
 # =========================
-# Webhook worker (QUEUE) — стабільність 10/10
+# Webhook worker (QUEUE)
 # =========================
 async def _process_update_with_timeout(update: dict):
     try:
@@ -667,7 +754,7 @@ async def _process_update_with_timeout(update: dict):
         log.error(traceback.format_exc())
 
 async def update_worker():
-    log.info("✅ update_worker started")
+    log.info("✅ update_worker started boot_id=%s pid=%s", boot_id, process_id)
     while True:
         upd = await update_queue.get()
         try:
@@ -679,7 +766,9 @@ async def update_worker():
 # Webhook server (aiohttp)
 # =========================
 async def on_startup(app: web.Application):
-    # старт воркера
+    log.info("🚀 BOOT boot_id=%s pid=%s", boot_id, process_id)
+    await load_state()
+
     app["worker_task"] = asyncio.create_task(update_worker())
 
     if not WEBHOOK_BASE:
@@ -700,7 +789,6 @@ async def on_shutdown(app: web.Application):
     except Exception:
         pass
 
-    # стоп воркера
     wt: asyncio.Task = app.get("worker_task")
     if wt:
         wt.cancel()
@@ -712,16 +800,11 @@ async def on_shutdown(app: web.Application):
     await bot.session.close()
 
 async def handle_webhook(request: web.Request):
-    """
-    Відповідаємо Telegram МИТТЄВО (200 OK),
-    апдейт кладемо в чергу (послідовна обробка + таймаути).
-    """
     try:
         update = await request.json()
     except Exception:
         return web.Response(text="ok")
 
-    # якщо черга переповнилась — не вбиваєм процес, але логнемо
     if update_queue.full():
         log.error("❌ UPDATE QUEUE FULL (%s). Dropping update.", UPDATE_QUEUE_MAX)
         return web.Response(text="ok")
@@ -744,6 +827,7 @@ def build_app():
 
 if __name__ == "__main__":
     web.run_app(build_app(), host="0.0.0.0", port=PORT)
+
 
 
 
