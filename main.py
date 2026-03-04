@@ -179,14 +179,12 @@ async def safe_edit(cb: CallbackQuery, text: str, reply_markup=None):
         if msg.text is not None:
             await msg.edit_text(text, reply_markup=reply_markup)
             return
-        # якщо це фото/медіа з caption
         if msg.caption is not None or msg.photo or msg.document or msg.video:
             await msg.edit_caption(caption=text, reply_markup=reply_markup)
             return
     except Exception as e:
         print("safe_edit failed:", repr(e))
 
-    # fallback: просто нове повідомлення
     try:
         await msg.answer(text, reply_markup=reply_markup)
     except Exception as e:
@@ -207,12 +205,9 @@ class CrashGuardMiddleware(BaseMiddleware):
             return await handler(event, data)
         except Exception as e:
             print("🔥 UNHANDLED ERROR:", repr(e))
-            # важливо: не валимо процес
             return
 
 dp.update.middleware(CrashGuardMiddleware())
-
-
 
 # ---------- admin file_id ----------
 @dp.message(Command("fileid"))
@@ -310,7 +305,6 @@ async def prod(cb: CallbackQuery):
     item = find_item_by_sku(sku)
 
     if not item:
-        # show_alert=True щоб користувач точно побачив
         await cb.answer("Товар не знайдено", show_alert=True)
         return
 
@@ -321,7 +315,6 @@ async def prod(cb: CallbackQuery):
     )
 
     try:
-        # ВАЖЛИВО: не редагуємо поточне повідомлення — шлемо нове
         photo_id = (item.get("photo") or "").strip()
 
         if photo_id:
@@ -332,7 +325,6 @@ async def prod(cb: CallbackQuery):
                     reply_markup=product_kb(sku)
                 )
             except Exception as e:
-                # типово: wrong file identifier / file not found / etc.
                 print("answer_photo failed:", repr(e))
                 await cb.message.answer(
                     text + "\n\n⚠️ Фото тимчасово недоступне (file_id).",
@@ -342,7 +334,6 @@ async def prod(cb: CallbackQuery):
             await cb.message.answer(text, reply_markup=product_kb(sku))
 
     except Exception as e:
-        # страховка на все інше (щоб потік не падав)
         print("prod handler failed:", repr(e))
         try:
             await cb.message.answer(
@@ -353,7 +344,6 @@ async def prod(cb: CallbackQuery):
             pass
 
     finally:
-        # ГОЛОВНЕ: щоб Telegram не крутив “loading…”
         try:
             await cb.answer()
         except Exception:
@@ -416,101 +406,107 @@ async def flow_contact(m: Message):
     )
     await m.answer("Оберіть тип отримання:", reply_markup=kb)
 
-# FLOW: тільки текст
+# FLOW: тільки текст (PROD: не зависає, логить помилки)
 @dp.message(F.text)
 async def flow(m: Message):
     user_id = m.from_user.id
     if user_id not in draft:
         return
 
-    step = draft[user_id].get("step")
+    try:
+        step = draft[user_id].get("step")
+        txt = (m.text or "").strip()
 
-    if step == "name":
-        draft[user_id]["name"] = (m.text or "").strip()
-        draft[user_id]["step"] = "phone"
-        kb = ReplyKeyboardMarkup(
-            keyboard=[[KeyboardButton(text="📱 Поділитися контактом", request_contact=True)]],
-            resize_keyboard=True, one_time_keyboard=True
-        )
-        await m.answer("📱 Надішліть телефон (кнопкою) або введіть вручну:", reply_markup=kb)
-        return
+        if step == "name":
+            draft[user_id]["name"] = txt
+            draft[user_id]["step"] = "phone"
+            kb = ReplyKeyboardMarkup(
+                keyboard=[[KeyboardButton(text="📱 Поділитися контактом", request_contact=True)]],
+                resize_keyboard=True, one_time_keyboard=True
+            )
+            await m.answer("📱 Надішліть телефон (кнопкою) або введіть вручну:", reply_markup=kb)
+            return
 
-    if step == "phone":
-        phone = (m.text or "").strip()
-        draft[user_id]["phone"] = phone
-        draft[user_id]["step"] = "deliveryType"
-        kb = ReplyKeyboardMarkup(
-            keyboard=[[KeyboardButton(text="🚚 Доставка"), KeyboardButton(text="🏃 Самовивіз")]],
-            resize_keyboard=True, one_time_keyboard=True
-        )
-        await m.answer("Оберіть тип отримання:", reply_markup=kb)
-        return
+        if step == "phone":
+            draft[user_id]["phone"] = txt
+            draft[user_id]["step"] = "deliveryType"
+            kb = ReplyKeyboardMarkup(
+                keyboard=[[KeyboardButton(text="🚚 Доставка"), KeyboardButton(text="🏃 Самовивіз")]],
+                resize_keyboard=True, one_time_keyboard=True
+            )
+            await m.answer("Оберіть тип отримання:", reply_markup=kb)
+            return
 
-    if step == "deliveryType":
-        t = (m.text or "").strip()
-        if "Самовивіз" in t:
-            draft[user_id]["deliveryType"] = "PICKUP"
-            draft[user_id]["address"] = "-"
+        if step == "deliveryType":
+            if "Самовивіз" in txt:
+                draft[user_id]["deliveryType"] = "PICKUP"
+                draft[user_id]["address"] = "-"
+                draft[user_id]["step"] = "datetime"
+                await m.answer("🕒 Вкажіть дату/час (наприклад: завтра 14:00):", reply_markup=main_menu_kb())
+                return
+
+            if "Доставка" in txt:
+                draft[user_id]["deliveryType"] = "DELIVERY"
+                draft[user_id]["step"] = "address"
+                await m.answer("🏠 Введіть адресу доставки:", reply_markup=main_menu_kb())
+                return
+
+            await m.answer("Будь ласка, натисніть кнопку: 🚚 Доставка або 🏃 Самовивіз")
+            return
+
+        if step == "address":
+            draft[user_id]["address"] = txt
             draft[user_id]["step"] = "datetime"
-            await m.answer("🕒 Вкажіть дату/час (наприклад: завтра 14:00):", reply_markup=main_menu_kb())
+            await m.answer("🕒 Вкажіть дату/час (наприклад: сьогодні 19:30):")
             return
-        if "Доставка" in t:
-            draft[user_id]["deliveryType"] = "DELIVERY"
-            draft[user_id]["step"] = "address"
-            await m.answer("🏠 Введіть адресу доставки:", reply_markup=main_menu_kb())
+
+        if step == "datetime":
+            draft[user_id]["datetime"] = txt
+            draft[user_id]["step"] = "comment"
+            await m.answer("💬 Коментар (якщо НП — місто, відділення, ПІБ, телефон):")
             return
-        await m.answer("Будь ласка, натисніть кнопку: 🚚 Доставка або 🏃 Самовивіз")
-        return
 
-    if step == "address":
-        draft[user_id]["address"] = (m.text or "").strip()
-        draft[user_id]["step"] = "datetime"
-        await m.answer("🕒 Вкажіть дату/час (наприклад: сьогодні 19:30):")
-        return
+        if step == "comment":
+            comment = txt
+            if comment == "-":
+                comment = ""
+            draft[user_id]["comment"] = comment
 
-    if step == "datetime":
-        draft[user_id]["datetime"] = (m.text or "").strip()
-        draft[user_id]["step"] = "comment"
-        await m.answer("💬 Коментар (якщо НП — місто, відділення, ПІБ, телефон):")
-        return
+            items: List[Dict[str, Any]] = []
+            for sku, qty in carts.get(user_id, {}).items():
+                it = find_item_by_sku(sku)
+                if it:
+                    items.append({"sku": sku, "title": it["title"], "qty": qty, "price": it["price"]})
 
-    if step == "comment":
-        comment = (m.text or "").strip()
-        if comment == "-":
-            comment = ""
-        draft[user_id]["comment"] = comment
+            total = calc_total(user_id)
 
-        items: List[Dict[str, Any]] = []
-        for sku, qty in carts.get(user_id, {}).items():
-            it = find_item_by_sku(sku)
-            if it:
-                items.append({"sku": sku, "title": it["title"], "qty": qty, "price": it["price"]})
+            summary = [
+                "✅ Перевірте замовлення:",
+                cart_text(user_id),
+                "",
+                f"Ім’я: {draft[user_id]['name']}",
+                f"Телефон: {draft[user_id]['phone']}",
+                f"Тип: {draft[user_id]['deliveryType']}",
+                f"Адреса: {draft[user_id].get('address','-')}",
+                f"Дата/час: {draft[user_id]['datetime']}",
+                f"Коментар: {draft[user_id]['comment'] or '-'}",
+            ]
 
-        total = calc_total(user_id)
+            kb = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="✅ Підтвердити", callback_data="confirm")],
+                [InlineKeyboardButton(text="❌ Скасувати", callback_data="cancel")]
+            ])
 
-        summary = [
-            "✅ Перевірте замовлення:",
-            cart_text(user_id),
-            "",
-            f"Ім’я: {draft[user_id]['name']}",
-            f"Телефон: {draft[user_id]['phone']}",
-            f"Тип: {draft[user_id]['deliveryType']}",
-            f"Адреса: {draft[user_id].get('address','-')}",
-            f"Дата/час: {draft[user_id]['datetime']}",
-            f"Коментар: {draft[user_id]['comment'] or '-'}",
-        ]
+            draft[user_id]["items"] = items
+            draft[user_id]["total"] = total
+            draft[user_id]["step"] = "confirm_wait"
 
-        kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="✅ Підтвердити", callback_data="confirm")],
-            [InlineKeyboardButton(text="❌ Скасувати", callback_data="cancel")]
-        ])
+            await m.answer("\n".join(summary), reply_markup=kb)
+            return
 
-        draft[user_id]["items"] = items
-        draft[user_id]["total"] = total
-        draft[user_id]["step"] = "confirm_wait"
-
-        await m.answer("\n".join(summary), reply_markup=kb)
-        return
+    except Exception as e:
+        print("FLOW ERROR:", repr(e), "step=", draft.get(user_id, {}).get("step"))
+        await m.answer("⚠️ Сталась технічна помилка. Спробуйте ще раз або /start.")
 
 @dp.callback_query(F.data == "cancel")
 async def cancel(cb: CallbackQuery):
@@ -657,7 +653,6 @@ def build_app():
 
 if __name__ == "__main__":
     web.run_app(build_app(), host="0.0.0.0", port=PORT)
-
 
 
 
