@@ -530,7 +530,7 @@ async def contacts(m: Message):
 async def my_orders_stub(m: Message):
     if await _warn_in_flow(m):
         return
-    await safe_send(m, "🧾 Поки що в демо показ 'Мої замовлення' буде на наступному кроці.")
+    await safe_send(m, "🧾 Демо показ. 'Мої замовлення' буде на наступному кроці.")
 
 
 @dp.callback_query(F.data == "cats")
@@ -703,7 +703,7 @@ async def flow(m: Message):
             draft[user_id]["address"] = "-"
             draft[user_id]["step"] = "datetime"
             await save_state("delivery_pickup")
-            await safe_send(m, "🕒 Вкажіть дату/час (наприклад: завтра 14:00):")
+            await safe_send(m, "🕒 Вкажіть біжіну дату/час (наприклад: завтра 14:00):")
             return
 
         if "Доставка" in text:
@@ -720,14 +720,14 @@ async def flow(m: Message):
         draft[user_id]["address"] = text
         draft[user_id]["step"] = "datetime"
         await save_state("address")
-        await safe_send(m, "🕒 Вкажіть дату/час (наприклад: сьогодні 19:30):")
+        await safe_send(m, "🕒 Вкажіть бажану дату/час (наприклад: сьогодні 19:30):")
         return
 
     if step == "datetime":
         draft[user_id]["datetime"] = text
         draft[user_id]["step"] = "comment"
         await save_state("datetime")
-        await safe_send(m, "💬 Коментар (якщо НП — місто, відділення, ПІБ, телефон):")
+        await safe_send(m, "💬 Коментар (напишіть коментар або просто напишіть - щоб перейти до підтвердження замовлення):")
         return
 
     if step == "comment":
@@ -776,6 +776,14 @@ async def cancel(cb: CallbackQuery):
     await safe_edit(cb, "❌ Замовлення скасовано.")
     await tg_call(cb.answer(), what="cb.answer(cancel)")
 
+await tg_call(
+    bot.send_message(
+        chat_id=cb.from_user.id,
+        text="Ок. Щоб почати заново — натисніть 🛒 Зробити замовлення або 📦 Каталог / Меню.",
+        reply_markup=main_menu_kb()
+    ),
+    what="post_cancel_main_menu"
+)
 
 @dp.callback_query(F.data == "confirm")
 async def confirm(cb: CallbackQuery):
@@ -829,7 +837,14 @@ async def confirm(cb: CallbackQuery):
 
     order_id = str(res.get("orderId", ""))
     await safe_edit(cb, f"🎉 Дякуємо! Замовлення прийнято.\nНомер: #{order_id}\nМенеджер скоро зв’яжеться.")
-
+await tg_call(
+    bot.send_message(
+        chat_id=user_id,
+        text="✅ Якщо бажаєте зробити наступне замовлення — натисніть 🛒 Зробити замовлення або відкрийте 📦 Каталог / Меню.",
+        reply_markup=main_menu_kb()
+    ),
+    what="post_confirm_main_menu"
+)
     mgr_text = [
         f"🆕 НОВЕ ЗАМОВЛЕННЯ #{order_id}",
         f"Ім’я: {d.get('name','')}",
@@ -1017,6 +1032,7 @@ def build_app():
 
 if __name__ == "__main__":
     web.run_app(build_app(), host="0.0.0.0", port=PORT)
+
 
 
 
