@@ -4,7 +4,7 @@ import logging
 import asyncio
 import traceback
 from datetime import datetime
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Set
 import uuid
 import time
 
@@ -19,7 +19,6 @@ from aiogram.types import (
 from aiogram.filters import CommandStart, Command
 from aiogram import BaseMiddleware
 from aiogram.types import TelegramObject
-
 from aiogram.client.session.aiohttp import AiohttpSession
 
 
@@ -37,7 +36,10 @@ log = logging.getLogger("tg-order-bot")
 # ENV
 # =========================
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-ADMIN_IDS = set(int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip().isdigit())
+
+# SUPERADMINS from env (your ids) - keep as is
+ADMIN_IDS: Set[int] = set(int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip().isdigit())
+
 MANAGER_CHAT_ID = int((os.getenv("MANAGER_CHAT_ID", "0").strip() or "0"))
 
 GS_ENDPOINT = os.getenv("GS_ENDPOINT", "").strip()
@@ -50,12 +52,9 @@ WEBHOOK_BASE = (os.getenv("WEBHOOK_BASE", "").strip() or os.getenv("RENDER_EXTER
 WEBHOOK_PATH = os.getenv("WEBHOOK_PATH", "/webhook").strip()
 PORT = int((os.getenv("PORT", "10000") or "10000"))
 
-# IMPORTANT:
-# drop pending updates ONLY when you intentionally want to clear the backlog
 DROP_PENDING_UPDATES = os.getenv("DROP_PENDING_UPDATES", "0").strip() in ("1", "true", "True", "YES", "yes")
-
-# Catalog auto-load at boot (optional)
 CATALOG_AUTOLOAD = os.getenv("CATALOG_AUTOLOAD", "0").strip() in ("1", "true", "True", "YES", "yes")
+ROLES_AUTOLOAD = os.getenv("ROLES_AUTOLOAD", "1").strip() in ("1", "true", "True", "YES", "yes")
 
 WEBHOOK_BASE = WEBHOOK_BASE.rstrip("/") if WEBHOOK_BASE else ""
 
@@ -99,10 +98,17 @@ CATALOG = {
     ],
 }
 
-# Runtime-loaded catalog from Google Sheets (same structure as CATALOG)
 CATALOG_RUNTIME: Dict[str, List[Dict[str, Any]]] = {}
 CATALOG_LOADED_AT: Optional[str] = None
 catalog_lock = asyncio.Lock()
+
+
+# =========================
+# Roles (runtime from sheet)
+# =========================
+ROLES_RUNTIME: Dict[int, str] = {}  # tg_id -> ROLE
+ROLES_LOADED_AT: Optional[str] = None
+roles_lock = asyncio.Lock()
 
 
 # =========================
@@ -248,8 +254,18 @@ async def safe_typing_delay():
 
 
 def _active_catalog() -> Dict[str, List[Dict[str, Any]]]:
-    # prefer runtime catalog if loaded, otherwise fallback hardcoded
     return CATALOG_RUNTIME if CATALOG_RUNTIME else CATALOG
+
+
+def _role_of(uid: int) -> str:
+    if uid in ADMIN_IDS:
+        return "SUPERADMIN"
+    return ROLES_RUNTIME.get(uid, "")
+
+
+def _has_any_role(uid: int, allowed: Set[str]) -> bool:
+    r = _role_of(uid)
+    return (r in allowed)
 
 
 def main_menu_kb() -> ReplyKeyboardMarkup:
@@ -381,65 +397,55 @@ async def safe_edit(cb: CallbackQuery, text: str, reply_markup=None):
 gs_http: Optional[ClientSession] = None
 
 
-async def gs_create_order(payload: Dict[str, Any]) -> Dict[str, Any]:
+async def _gs_post(payload: Dict[str, Any]) -> Dict[str, Any]:
     global gs_http
     if gs_http is None:
         return {"ok": False, "error": "GS session not initialized"}
+
     try:
         async with gs_http.post(GS_ENDPOINT, json=payload) as resp:
             text = await resp.text()
             try:
-                return json.loads(text)
+                data = json.loads(text)
+                # attach status for debugging
+                if isinstance(data, dict):
+                    data["_http_status"] = resp.status
+                return data
             except Exception:
-                return {"ok": False, "error": f"Bad response: {text[:200]}"}
+                return {"ok": False, "error": f"Bad JSON response (status={resp.status}): {text[:400]}"}
     except Exception as e:
         return {"ok": False, "error": f"GS request failed: {repr(e)}"}
+
+
+async def gs_create_order(payload: Dict[str, Any]) -> Dict[str, Any]:
+    return await _gs_post(payload)
 
 
 async def gs_update_status(order_id: str, status: str) -> Dict[str, Any]:
-    global gs_http
-    if gs_http is None:
-        return {"ok": False, "error": "GS session not initialized"}
     payload = {"key": GS_KEY, "action": "updateStatus", "bizId": BIZ_ID, "orderId": order_id, "status": status}
-    try:
-        async with gs_http.post(GS_ENDPOINT, json=payload) as resp:
-            text = await resp.text()
-            try:
-                return json.loads(text)
-            except Exception:
-                return {"ok": False, "error": f"Bad response: {text[:200]}"}
-    except Exception as e:
-        return {"ok": False, "error": f"GS request failed: {repr(e)}"}
+    return await _gs_post(payload)
 
 
 async def gs_get_catalog() -> Dict[str, Any]:
-    global gs_http
-    if gs_http is None:
-        return {"ok": False, "error": "GS session not initialized"}
     payload = {"key": GS_KEY, "action": "getCatalog", "bizId": BIZ_ID}
-    try:
-        async with gs_http.post(GS_ENDPOINT, json=payload) as resp:
-            text = await resp.text()
-            try:
-                return json.loads(text)
-            except Exception:
-                return {"ok": False, "error": f"Bad response: {text[:200]}"}
-    except Exception as e:
-        return {"ok": False, "error": f"GS request failed: {repr(e)}"}
+    return await _gs_post(payload)
+
+
+async def gs_get_roles() -> Dict[str, Any]:
+    payload = {"key": GS_KEY, "action": "getRoles", "bizId": BIZ_ID}
+    return await _gs_post(payload)
 
 
 def _build_catalog_runtime(gs_payload: Dict[str, Any]) -> Dict[str, List[Dict[str, Any]]]:
-    """
-    Convert GS catalog: categories(id,title,sort) + products(... image_url status)
-    into dict: {categoryTitle: [items...]}
-    """
     catalog = (gs_payload.get("catalog") or {})
     categories = catalog.get("categories") or []
     products = catalog.get("products") or []
 
     id_to_title: Dict[str, str] = {}
-    # sort categories by sort, then title
-    categories_sorted = sorted(categories, key=lambda x: (int(x.get("sort") or 0), str(x.get("title") or "")))
+    categories_sorted = sorted(
+        categories,
+        key=lambda x: (int(float(x.get("sort") or 0)), str(x.get("title") or ""))
+    )
     for c in categories_sorted:
         cid = str(c.get("id") or "").strip()
         title = str(c.get("title") or "").strip()
@@ -466,13 +472,13 @@ def _build_catalog_runtime(gs_payload: Dict[str, Any]) -> Dict[str, List[Dict[st
             "title": title,
             "description": descr,
             "price": price,
-            "photo": image_url,   # IMPORTANT: now URL
+            "photo": image_url,   # URL works for Telegram sendPhoto if public https
             "status": status
         })
 
-    # optional: stable ordering inside category
-    for k in out.keys():
+    for k in list(out.keys()):
         out[k] = sorted(out[k], key=lambda it: it.get("title", ""))
+
     return out
 
 
@@ -494,6 +500,33 @@ async def refresh_catalog(reason: str = "") -> Dict[str, Any]:
             return {"ok": False, "error": f"catalog parse failed: {repr(e)}"}
 
 
+async def refresh_roles(reason: str = "") -> Dict[str, Any]:
+    global ROLES_RUNTIME, ROLES_LOADED_AT
+    async with roles_lock:
+        res = await gs_get_roles()
+        if not res.get("ok"):
+            return res
+        try:
+            roles_map = res.get("roles") or {}
+            parsed: Dict[int, str] = {}
+            for k, v in roles_map.items():
+                try:
+                    uid = int(str(k).strip())
+                    role = str(v or "").strip().upper()
+                    if role:
+                        parsed[uid] = role
+                except Exception:
+                    pass
+            ROLES_RUNTIME = parsed
+            ROLES_LOADED_AT = now_str()
+            log.info("👤 roles refreshed (%s) users=%d", reason, len(ROLES_RUNTIME))
+            return {"ok": True, "users": len(ROLES_RUNTIME), "loaded_at": ROLES_LOADED_AT}
+        except Exception as e:
+            log.error("roles parse failed: %r", e)
+            log.error(traceback.format_exc())
+            return {"ok": False, "error": f"roles parse failed: {repr(e)}"}
+
+
 # =========================
 # Bot + Dispatcher
 # =========================
@@ -509,6 +542,7 @@ class CrashGuardMiddleware(BaseMiddleware):
         except Exception as e:
             log.error("🔥 UNHANDLED ERROR: %r", e)
             log.error(traceback.format_exc())
+            # do not crash, but also do not silently ignore in command flow
             return
 
 
@@ -516,24 +550,45 @@ dp.update.middleware(CrashGuardMiddleware())
 
 
 # =========================
-# Admin catalog commands
+# Admin commands (with roles)
 # =========================
+@dp.message(Command("refresh_roles"))
+async def cmd_refresh_roles(m: Message):
+    uid = m.from_user.id
+    if not _has_any_role(uid, {"SUPERADMIN", "ADMIN"}):
+        await safe_send(m, "⛔ Немає доступу (потрібна роль ADMIN/SUPERADMIN).")
+        return
+    await safe_send(m, "⏳ Оновлюю ролі з Google Sheets...")
+    res = await refresh_roles("manual")
+    await safe_send(m, f"✅ {res}" if res.get("ok") else f"❌ {res}")
+
+
 @dp.message(Command("refresh_catalog"))
 async def cmd_refresh_catalog(m: Message):
-    if ADMIN_IDS and m.from_user.id not in ADMIN_IDS:
+    uid = m.from_user.id
+    if not _has_any_role(uid, {"SUPERADMIN", "ADMIN"}):
+        await safe_send(m, "⛔ Немає доступу (потрібна роль ADMIN/SUPERADMIN).")
         return
+
     await safe_send(m, "⏳ Оновлюю каталог з Google Sheets...")
-    res = await refresh_catalog("manual")
-    if res.get("ok"):
-        await safe_send(m, f"✅ Каталог оновлено. Категорій: {res.get('categories')} | {res.get('loaded_at')}")
-    else:
-        await safe_send(m, f"❌ Не вдалося оновити каталог: {res}")
+
+    try:
+        res = await refresh_catalog("manual")
+        if res.get("ok"):
+            await safe_send(m, f"✅ Каталог оновлено. Категорій: {res.get('categories')} | {res.get('loaded_at')}")
+        else:
+            await safe_send(m, f"❌ Не вдалося оновити каталог: {res}")
+    except Exception as e:
+        await safe_send(m, f"❌ refresh_catalog crashed: {repr(e)}")
 
 
 @dp.message(Command("catalog_info"))
 async def cmd_catalog_info(m: Message):
-    if ADMIN_IDS and m.from_user.id not in ADMIN_IDS:
+    uid = m.from_user.id
+    if not _has_any_role(uid, {"SUPERADMIN", "ADMIN"}):
+        await safe_send(m, "⛔ Немає доступу (потрібна роль ADMIN/SUPERADMIN).")
         return
+
     src = _active_catalog()
     total_items = sum(len(v) for v in src.values())
     await safe_send(
@@ -541,25 +596,28 @@ async def cmd_catalog_info(m: Message):
         f"📦 Catalog info\n"
         f"loaded_at={CATALOG_LOADED_AT}\n"
         f"categories={len(src)} items={total_items}\n"
-        f"source={'GS' if CATALOG_RUNTIME else 'fallback'}"
+        f"source={'GS' if CATALOG_RUNTIME else 'fallback'}\n"
+        f"roles_loaded_at={ROLES_LOADED_AT} roles_users={len(ROLES_RUNTIME)}\n"
+        f"your_role={_role_of(uid)}"
     )
 
 
-# =========================
-# Admin debug
-# =========================
 @dp.message(Command("debug_state"))
 async def debug_state(m: Message):
-    if ADMIN_IDS and m.from_user.id not in ADMIN_IDS:
-        return
     uid = m.from_user.id
+    if not _has_any_role(uid, {"SUPERADMIN", "ADMIN"}):
+        await safe_send(m, "⛔ Немає доступу (потрібна роль ADMIN/SUPERADMIN).")
+        return
+
     await safe_send(
         m,
         f"DEBUG boot_id={boot_id} pid={process_id}\nuser={uid}\n"
+        f"your_role={_role_of(uid)}\n"
         f"draft={draft.get(uid)}\ncart={carts.get(uid)}\nqueue={update_queue.qsize()}\n"
         f"workers={WORKERS} inflight_limit={MAX_INFLIGHT}\n"
         f"drop_pending={DROP_PENDING_UPDATES}\n"
-        f"catalog_loaded_at={CATALOG_LOADED_AT} runtime_categories={len(CATALOG_RUNTIME)}"
+        f"catalog_loaded_at={CATALOG_LOADED_AT} runtime_categories={len(CATALOG_RUNTIME)}\n"
+        f"roles_loaded_at={ROLES_LOADED_AT} roles_users={len(ROLES_RUNTIME)}"
     )
 
 
@@ -582,9 +640,11 @@ async def reset(m: Message):
 # =========================
 @dp.message(Command("fileid"))
 async def fileid_help(m: Message):
-    if ADMIN_IDS and m.from_user.id not in ADMIN_IDS:
+    uid = m.from_user.id
+    if not _has_any_role(uid, {"SUPERADMIN", "ADMIN"}):
+        await safe_send(m, "⛔ Немає доступу (потрібна роль ADMIN/SUPERADMIN).")
         return
-    fileid_mode[m.from_user.id] = True
+    fileid_mode[uid] = True
     await save_state("fileid_on")
     await safe_send(
         m,
@@ -596,18 +656,21 @@ async def fileid_help(m: Message):
 
 @dp.message(Command("fileidoff"))
 async def fileid_off(m: Message):
-    if ADMIN_IDS and m.from_user.id not in ADMIN_IDS:
+    uid = m.from_user.id
+    if not _has_any_role(uid, {"SUPERADMIN", "ADMIN"}):
+        await safe_send(m, "⛔ Немає доступу (потрібна роль ADMIN/SUPERADMIN).")
         return
-    fileid_mode[m.from_user.id] = False
+    fileid_mode[uid] = False
     await save_state("fileid_off")
     await safe_send(m, "✅ Режим file_id вимкнено.")
 
 
 @dp.message(F.photo)
 async def fileid_photo(m: Message):
-    if ADMIN_IDS and m.from_user.id not in ADMIN_IDS:
+    uid = m.from_user.id
+    if not _has_any_role(uid, {"SUPERADMIN", "ADMIN"}):
         return
-    if not fileid_mode.get(m.from_user.id, False):
+    if not fileid_mode.get(uid, False):
         return
     photo = m.photo[-1]
     await safe_send(m, f"✅ file_id:\n{photo.file_id}")
@@ -1036,7 +1099,9 @@ async def confirm(cb: CallbackQuery):
 
 @dp.callback_query(F.data.startswith("st:"))
 async def set_status(cb: CallbackQuery):
-    if ADMIN_IDS and cb.from_user.id not in ADMIN_IDS and cb.from_user.id != MANAGER_CHAT_ID:
+    uid = cb.from_user.id
+    # allow: SUPERADMIN/ADMIN/MANAGER or MANAGER_CHAT_ID
+    if uid != MANAGER_CHAT_ID and not _has_any_role(uid, {"SUPERADMIN", "ADMIN", "MANAGER"}):
         await tg_call(cb.answer("Немає доступу", show_alert=True), what="cb.answer(st_denied)")
         return
 
@@ -1099,9 +1164,14 @@ async def app_lifecycle(app: web.Application):
             worker_tasks.append(t)
         app["worker_tasks"] = worker_tasks
 
+        # auto-load roles first
+        if ROLES_AUTOLOAD:
+            rr = await refresh_roles("boot")
+            log.info("roles autoload result: %s", rr)
+
         if CATALOG_AUTOLOAD:
-            res = await refresh_catalog("boot")
-            log.info("catalog autoload result: %s", res)
+            rc = await refresh_catalog("boot")
+            log.info("catalog autoload result: %s", rc)
 
         if WEBHOOK_BASE:
             webhook_url = f"{WEBHOOK_BASE}{WEBHOOK_PATH}"
@@ -1176,7 +1246,9 @@ def build_app():
             "inflight_limit": MAX_INFLIGHT,
             "drop_pending": DROP_PENDING_UPDATES,
             "catalog_loaded_at": CATALOG_LOADED_AT,
-            "runtime_categories": len(CATALOG_RUNTIME)
+            "runtime_categories": len(CATALOG_RUNTIME),
+            "roles_loaded_at": ROLES_LOADED_AT,
+            "roles_users": len(ROLES_RUNTIME),
         })
 
     app.router.add_get("/", health)
@@ -1189,6 +1261,7 @@ def build_app():
 
 if __name__ == "__main__":
     web.run_app(build_app(), host="0.0.0.0", port=PORT)
+
 
 
 
