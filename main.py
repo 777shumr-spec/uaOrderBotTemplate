@@ -500,6 +500,7 @@ async def refresh_catalog(reason: str = "") -> Dict[str, Any]:
             return {"ok": False, "error": f"catalog parse failed: {repr(e)}"}
 
 
+
 async def refresh_roles(reason: str = "") -> Dict[str, Any]:
     global ROLES_RUNTIME, ROLES_LOADED_AT
     async with roles_lock:
@@ -552,12 +553,36 @@ dp.update.middleware(CrashGuardMiddleware())
 # =========================
 # Admin commands (with roles)
 # =========================
+
+@dp.message(Command("whoami"))
+async def cmd_whoami(m: Message):
+    uid = m.from_user.id
+    await safe_send(
+        m,
+        f"you={uid}\n"
+        f"your_role={_role_of(uid) or 'NONE'}\n"
+        f"roles_loaded_at={ROLES_LOADED_AT}\n"
+        f"roles_users={len(ROLES_RUNTIME)}\n"
+        f"admin_ids_env={sorted(list(ADMIN_IDS))}"
+    )
+
+@dp.message(Command("gs_roles_raw"))
+async def cmd_gs_roles_raw(m: Message):
+    uid = m.from_user.id
+    if uid not in ADMIN_IDS:
+        return
+    res = await gs_get_roles()
+    await safe_send(m, json.dumps(res, ensure_ascii=False)[:3500])
+
 @dp.message(Command("refresh_roles"))
 async def cmd_refresh_roles(m: Message):
     uid = m.from_user.id
-    if not _has_any_role(uid, {"SUPERADMIN", "ADMIN"}):
+
+    # аварійний ключ: якщо ти в ADMIN_IDS env — можеш оновити ролі завжди
+    if uid not in ADMIN_IDS and not _has_any_role(uid, {"SUPERADMIN", "ADMIN"}):
         await safe_send(m, "⛔ Немає доступу (потрібна роль ADMIN/SUPERADMIN).")
         return
+
     await safe_send(m, "⏳ Оновлюю ролі з Google Sheets...")
     res = await refresh_roles("manual")
     await safe_send(m, f"✅ {res}" if res.get("ok") else f"❌ {res}")
@@ -1261,6 +1286,7 @@ def build_app():
 
 if __name__ == "__main__":
     web.run_app(build_app(), host="0.0.0.0", port=PORT)
+
 
 
 
