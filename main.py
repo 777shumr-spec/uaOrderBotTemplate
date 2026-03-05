@@ -909,6 +909,10 @@ async def flow_contact(m: Message):
 
 @dp.message(F.text)
 async def flow(m: Message):
+    # ❗ не чіпаємо команди типу /ping /whoami /refresh_roles
+    if m.text and m.text.strip().startswith("/"):
+        return
+
     user_id = m.from_user.id
     if user_id not in draft:
         return
@@ -1141,6 +1145,33 @@ async def set_status(cb: CallbackQuery):
         await tg_call(cb.answer("Помилка оновлення статусу", show_alert=True), what="cb.answer(st_err)")
 
 
+
+
+@dp.message(F.text.startswith("/"))
+async def unknown_command(m: Message):
+    # якщо це відома команда — цей хендлер може теж спрацювати,
+    # тому даємо мінімальний захист: якщо команда відома, просто нічого не робимо
+    cmd = (m.text or "").split()[0].lower()
+
+    known = {
+        "/start", "/ping", "/whoami", "/refresh_roles", "/refresh_catalog",
+        "/catalog_info", "/debug_state", "/reset", "/fileid", "/fileidoff", "/gs_roles_raw"
+    }
+    if cmd in known:
+        return
+
+    await safe_send(
+        m,
+        "🤖 Команду не впізнав.\n"
+        "Доступні:\n"
+        "/ping\n"
+        "/whoami\n"
+        "/refresh_roles\n"
+        "/gs_roles_raw\n"
+        "/debug_state"
+    )
+
+
 # =========================
 # Workers
 # =========================
@@ -1286,6 +1317,7 @@ def build_app():
 
 if __name__ == "__main__":
     web.run_app(build_app(), host="0.0.0.0", port=PORT)
+
 
 
 
