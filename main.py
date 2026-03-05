@@ -162,6 +162,7 @@ boot_id = os.getenv("BOOT_ID", "") or str(uuid.uuid4())[:8]
 process_id = os.getpid()
 boot_ts = int(time.time())
 
+SCRIPT_SIGNATURE = "BOT_BUILD_2026-03-05__WHOAMI_FIX_V3"
 
 def _serialize_state() -> Dict[str, Any]:
     return {
@@ -549,6 +550,18 @@ class CrashGuardMiddleware(BaseMiddleware):
 
 dp.update.middleware(CrashGuardMiddleware())
 
+@dp.message()
+async def _debug_log_all_messages(m: Message):
+    # Лише лог, без відповіді. Допомагає побачити що реально прилітає.
+    try:
+        txt = (m.text or m.caption or "")
+        log.info("📩 IN msg from=%s chat=%s text=%r entities=%s",
+                 m.from_user.id if m.from_user else None,
+                 m.chat.id if m.chat else None,
+                 txt[:200],
+                 [(e.type, e.offset, e.length) for e in (m.entities or [])][:5])
+    except Exception:
+        pass
 
 # =========================
 # Admin commands (with roles)
@@ -1146,30 +1159,27 @@ async def set_status(cb: CallbackQuery):
 
 
 
-
-@dp.message(F.text.startswith("/"))
-async def unknown_command(m: Message):
-    # якщо це відома команда — цей хендлер може теж спрацювати,
-    # тому даємо мінімальний захист: якщо команда відома, просто нічого не робимо
-    cmd = (m.text or "").split()[0].lower()
-
-    known = {
-        "/start", "/ping", "/whoami", "/refresh_roles", "/refresh_catalog",
-        "/catalog_info", "/debug_state", "/reset", "/fileid", "/fileidoff", "/gs_roles_raw"
-    }
-    if cmd in known:
-        return
+# =========================
+# Fallback for ANY command (must be AFTER all specific command handlers)
+# =========================
+@dp.message(Command())
+async def any_command_fallback(m: Message):
+    # Якщо сюди потрапили — значить специфічний хендлер не спрацював.
+    cmd = (m.text or "").split()[0]
 
     await safe_send(
         m,
-        "🤖 Команду не впізнав.\n"
-        "Доступні:\n"
+        "🤖 Команду отримав, але відповідний хендлер не спрацював.\n\n"
+        f"Команда: {cmd}\n\n"
+        "Спробуйте:\n"
         "/ping\n"
         "/whoami\n"
         "/refresh_roles\n"
         "/gs_roles_raw\n"
-        "/debug_state"
+        "/debug_state\n\n"
+        "Якщо навіть /ping не відповідає — значить деплой/код не той або webhook веде не туди."
     )
+
 
 
 # =========================
@@ -1206,7 +1216,7 @@ async def update_worker(worker_id: int):
 async def app_lifecycle(app: web.Application):
     global gs_http
     log.info("🚀 BOOT boot_id=%s pid=%s drop_pending=%s", boot_id, process_id, DROP_PENDING_UPDATES)
-
+    log.info("🧩 SCRIPT_SIGNATURE=%s", SCRIPT_SIGNATURE)
     worker_tasks: List[asyncio.Task] = []
 
     try:
@@ -1317,6 +1327,7 @@ def build_app():
 
 if __name__ == "__main__":
     web.run_app(build_app(), host="0.0.0.0", port=PORT)
+
 
 
 
