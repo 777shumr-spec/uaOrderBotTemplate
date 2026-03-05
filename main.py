@@ -1174,7 +1174,7 @@ async def set_status(cb: CallbackQuery):
 # =========================
 # Fallback for ANY command (must be AFTER all specific command handlers)
 # =========================
-@dp.message(Command())
+@dp.message(F.text.startswith("/"))
 async def any_command_fallback(m: Message):
     cmd = (m.text or "").split()[0]
     await safe_send(
@@ -1337,6 +1337,7 @@ def build_app():
 
 if __name__ == "__main__":
     web.run_app(build_app(), host="0.0.0.0", port=PORT)
+
 
 
 
