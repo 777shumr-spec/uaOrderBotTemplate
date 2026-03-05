@@ -1160,7 +1160,34 @@ async def confirm(cb: CallbackQuery):
     await save_state("confirm_done")
 
 
-F.data.startswith("st:")
+@dp.callback_query(F.data.startswith("st:"))
+async def set_status(cb: CallbackQuery):
+    uid = cb.from_user.id
+    chat_id = cb.message.chat.id if (cb.message and cb.message.chat) else None
+
+    # 1) Якщо кнопки натискають НЕ в менеджерському чаті:
+    #    дозволяємо тільки SUPERADMIN/ADMIN (щоб не можна було керувати статусами з пересланих повідомлень)
+    if chat_id != MANAGER_CHAT_ID:
+        if not _has_any_role(uid, {"SUPERADMIN", "ADMIN"}):
+            await tg_call(cb.answer("Немає доступу", show_alert=True), what="cb.answer(st_denied_outside)")
+            return
+    else:
+        # 2) Якщо натискають в групі менеджера — дозволяємо MANAGER теж
+        if not _has_any_role(uid, {"SUPERADMIN", "ADMIN", "MANAGER"}):
+            await tg_call(cb.answer("Немає доступу", show_alert=True), what="cb.answer(st_denied_group)")
+            return
+
+    _, order_id, status, user_tg_id = cb.data.split(":", 3)
+    res = await gs_update_status(order_id, status)
+
+    if res.get("ok"):
+        await tg_call(cb.answer(f"Статус: {status} ✅"), what="cb.answer(st_ok)")
+        await tg_call(
+            bot.send_message(int(user_tg_id), f"📦 Статус замовлення #{order_id}: {status}"),
+            what="notify_user_status"
+        )
+    else:
+        await tg_call(cb.answer("Помилка оновлення статусу", show_alert=True), what="cb.answer(st_err)")
 
 
 # =========================
@@ -1329,6 +1356,7 @@ def build_app():
 
 if __name__ == "__main__":
     web.run_app(build_app(), host="0.0.0.0", port=PORT)
+
 
 
 
