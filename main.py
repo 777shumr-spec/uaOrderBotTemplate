@@ -1303,19 +1303,20 @@ def build_app():
         return web.Response(text="ok")
 
     async def healthz(_request):
-        return web.json_response({
-            "ok": True,
-            "boot_id": boot_id,
-            "pid": process_id,
-            "queue": update_queue.qsize(),
-            "workers": WORKERS,
-            "inflight_limit": MAX_INFLIGHT,
-            "drop_pending": DROP_PENDING_UPDATES,
-            "catalog_loaded_at": CATALOG_LOADED_AT,
-            "runtime_categories": len(CATALOG_RUNTIME),
-            "roles_loaded_at": ROLES_LOADED_AT,
-            "roles_users": len(ROLES_RUNTIME),
-        })
+    return web.json_response({
+        "ok": True,
+        "script_signature": SCRIPT_SIGNATURE,
+        "boot_id": boot_id,
+        "pid": process_id,
+        "queue": update_queue.qsize(),
+        "workers": WORKERS,
+        "inflight_limit": MAX_INFLIGHT,
+        "drop_pending": DROP_PENDING_UPDATES,
+        "catalog_loaded_at": CATALOG_LOADED_AT,
+        "runtime_categories": len(CATALOG_RUNTIME),
+        "roles_loaded_at": ROLES_LOADED_AT,
+        "roles_users": len(ROLES_RUNTIME),
+    })
 
     app.router.add_get("/", health)
     app.router.add_get("/healthz", healthz)
@@ -1327,6 +1328,7 @@ def build_app():
 
 if __name__ == "__main__":
     web.run_app(build_app(), host="0.0.0.0", port=PORT)
+
 
 
 
