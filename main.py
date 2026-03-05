@@ -54,6 +54,9 @@ PORT = int((os.getenv("PORT", "10000") or "10000"))
 # drop pending updates ONLY when you intentionally want to clear the backlog
 DROP_PENDING_UPDATES = os.getenv("DROP_PENDING_UPDATES", "0").strip() in ("1", "true", "True", "YES", "yes")
 
+# Catalog auto-load at boot (optional)
+CATALOG_AUTOLOAD = os.getenv("CATALOG_AUTOLOAD", "0").strip() in ("1", "true", "True", "YES", "yes")
+
 WEBHOOK_BASE = WEBHOOK_BASE.rstrip("/") if WEBHOOK_BASE else ""
 
 if not BOT_TOKEN:
@@ -67,28 +70,39 @@ if MANAGER_CHAT_ID == 0:
 
 
 # =========================
-# Catalog
+# Catalog (fallback hardcoded)
 # =========================
 CATALOG = {
     "Десерти": [
         {"sku": "cake_napoleon", "title": "Торт «Наполеон»", "price": 650,
-         "photo": "AgACAgIAAxkBAAMHaagCWmo_c_YK4YRk5llKms4gd5MAAmEUaxvf1kFJr4WH6F_jZ_YBAAMCAANtAAM6BA"},
+         "photo": "AgACAgIAAxkBAAMHaagCWmo_c_YK4YRk5llKms4gd5MAAmEUaxvf1kFJr4WH6F_jZ_YBAAMCAANtAAM6BA",
+         "description": "", "status": "IN_STOCK"},
         {"sku": "cake_honey", "title": "Торт «Медовик»", "price": 620,
-         "photo": "AgACAgIAAxkBAAMJaagCZA-gL42QRDl6OvKYS399bb8AAmIUaxvf1kFJMk5lUqSqMKYBAAMCAANtAAM6BA"},
+         "photo": "AgACAgIAAxkBAAMJaagCZA-gL42QRDl6OvKYS399bb8AAmIUaxvf1kFJMk5lUqSqMKYBAAMCAANtAAM6BA",
+         "description": "", "status": "IN_STOCK"},
         {"sku": "cupcake", "title": "Капкейки (1 шт)", "price": 55,
-         "photo": "AgACAgIAAxkBAAMLaagCaUlnH66fW90ivi4WoagV48QAAmQUaxvf1kFJJql135zQU8gBAAMCAAN5AAM6BA"},
+         "photo": "AgACAgIAAxkBAAMLaagCaUlnH66fW90ivi4WoagV48QAAmQUaxvf1kFJJql135zQU8gBAAMCAAN5AAM6BA",
+         "description": "", "status": "IN_STOCK"},
     ],
     "Напої": [
         {"sku": "coffee", "title": "Кава", "price": 60,
-         "photo": "AgACAgIAAxkBAAMNaagCbRZCO8cFb1ZEzUQd8PwYcDkAAmUUaxvf1kFJF2S_0uLiApMBAAMCAAN4AAM6BA"},
+         "photo": "AgACAgIAAxkBAAMNaagCbRZCO8cFb1ZEzUQd8PwYcDkAAmUUaxvf1kFJF2S_0uLiApMBAAMCAAN4AAM6BA",
+         "description": "", "status": "IN_STOCK"},
         {"sku": "tea", "title": "Чай", "price": 40,
-         "photo": "AgACAgIAAxkBAAMPaagCcL_xVc5L4W67KjQmOuOBggYAAmYUaxvf1kFJZLj7jsw7_5sBAAMCAAN5AAM6BA"},
+         "photo": "AgACAgIAAxkBAAMPaagCcL_xVc5L4W67KjQmOuOBggYAAmYUaxvf1kFJZLj7jsw7_5sBAAMCAAN5AAM6BA",
+         "description": "", "status": "IN_STOCK"},
     ],
     "Інше": [
         {"sku": "gift_box", "title": "Подарункова коробка", "price": 80,
-         "photo": "AgACAgIAAxkBAAMRaagCdB_y-QfBwFl_9LLiQPrO_SIAAmcUaxvf1kFJhZ7nhJhjw9ABAAMCAAN4AAM6BA"},
+         "photo": "AgACAgIAAxkBAAMRaagCdB_y-QfBwFl_9LLiQPrO_SIAAmcUaxvf1kFJhZ7nhJhjw9ABAAMCAAN4AAM6BA",
+         "description": "", "status": "IN_STOCK"},
     ],
 }
+
+# Runtime-loaded catalog from Google Sheets (same structure as CATALOG)
+CATALOG_RUNTIME: Dict[str, List[Dict[str, Any]]] = {}
+CATALOG_LOADED_AT: Optional[str] = None
+catalog_lock = asyncio.Lock()
 
 
 # =========================
@@ -233,6 +247,11 @@ async def safe_typing_delay():
     await asyncio.sleep(0.08)
 
 
+def _active_catalog() -> Dict[str, List[Dict[str, Any]]]:
+    # prefer runtime catalog if loaded, otherwise fallback hardcoded
+    return CATALOG_RUNTIME if CATALOG_RUNTIME else CATALOG
+
+
 def main_menu_kb() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[
@@ -245,17 +264,20 @@ def main_menu_kb() -> ReplyKeyboardMarkup:
 
 
 def categories_kb() -> InlineKeyboardMarkup:
-    buttons = [[InlineKeyboardButton(text=cat, callback_data=f"cat:{cat}")] for cat in CATALOG.keys()]
+    cat_src = _active_catalog()
+    buttons = [[InlineKeyboardButton(text=cat, callback_data=f"cat:{cat}")] for cat in cat_src.keys()]
     buttons.append([InlineKeyboardButton(text="🧺 Кошик", callback_data="cart")])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
-def product_kb(sku: str) -> InlineKeyboardMarkup:
+def product_kb(sku: str, can_add: bool = True) -> InlineKeyboardMarkup:
+    row1 = []
+    if can_add:
+        row1.append(InlineKeyboardButton(text="➕ Додати", callback_data=f"add:{sku}"))
+    row1.append(InlineKeyboardButton(text="➖ Забрати", callback_data=f"rem:{sku}"))
+
     return InlineKeyboardMarkup(inline_keyboard=[
-        [
-            InlineKeyboardButton(text="➕ Додати", callback_data=f"add:{sku}"),
-            InlineKeyboardButton(text="➖ Забрати", callback_data=f"rem:{sku}")
-        ],
+        row1,
         [InlineKeyboardButton(text="🧺 Кошик", callback_data="cart")],
         [InlineKeyboardButton(text="⬅️ Категорії", callback_data="cats")]
     ])
@@ -280,9 +302,10 @@ def manager_status_kb(order_id: str, user_tg_id: str) -> InlineKeyboardMarkup:
 
 
 def find_item_by_sku(sku: str) -> Optional[Dict[str, Any]]:
-    for _, items in CATALOG.items():
+    cat_src = _active_catalog()
+    for _, items in cat_src.items():
         for it in items:
-            if it["sku"] == sku:
+            if it.get("sku") == sku:
                 return it
     return None
 
@@ -389,6 +412,88 @@ async def gs_update_status(order_id: str, status: str) -> Dict[str, Any]:
         return {"ok": False, "error": f"GS request failed: {repr(e)}"}
 
 
+async def gs_get_catalog() -> Dict[str, Any]:
+    global gs_http
+    if gs_http is None:
+        return {"ok": False, "error": "GS session not initialized"}
+    payload = {"key": GS_KEY, "action": "getCatalog", "bizId": BIZ_ID}
+    try:
+        async with gs_http.post(GS_ENDPOINT, json=payload) as resp:
+            text = await resp.text()
+            try:
+                return json.loads(text)
+            except Exception:
+                return {"ok": False, "error": f"Bad response: {text[:200]}"}
+    except Exception as e:
+        return {"ok": False, "error": f"GS request failed: {repr(e)}"}
+
+
+def _build_catalog_runtime(gs_payload: Dict[str, Any]) -> Dict[str, List[Dict[str, Any]]]:
+    """
+    Convert GS catalog: categories(id,title,sort) + products(... image_url status)
+    into dict: {categoryTitle: [items...]}
+    """
+    catalog = (gs_payload.get("catalog") or {})
+    categories = catalog.get("categories") or []
+    products = catalog.get("products") or []
+
+    id_to_title: Dict[str, str] = {}
+    # sort categories by sort, then title
+    categories_sorted = sorted(categories, key=lambda x: (int(x.get("sort") or 0), str(x.get("title") or "")))
+    for c in categories_sorted:
+        cid = str(c.get("id") or "").strip()
+        title = str(c.get("title") or "").strip()
+        if cid and title:
+            id_to_title[cid] = title
+
+    out: Dict[str, List[Dict[str, Any]]] = {title: [] for title in id_to_title.values()}
+
+    for p in products:
+        sku = str(p.get("sku") or "").strip()
+        cat_id = str(p.get("category_id") or "").strip()
+        title = str(p.get("title") or "").strip()
+        descr = str(p.get("description") or "").strip()
+        price = int(float(p.get("price") or 0))
+        image_url = str(p.get("image_url") or "").strip()
+        status = str(p.get("status") or "IN_STOCK").strip()
+
+        cat_title = id_to_title.get(cat_id)
+        if not (sku and cat_title and title):
+            continue
+
+        out.setdefault(cat_title, []).append({
+            "sku": sku,
+            "title": title,
+            "description": descr,
+            "price": price,
+            "photo": image_url,   # IMPORTANT: now URL
+            "status": status
+        })
+
+    # optional: stable ordering inside category
+    for k in out.keys():
+        out[k] = sorted(out[k], key=lambda it: it.get("title", ""))
+    return out
+
+
+async def refresh_catalog(reason: str = "") -> Dict[str, Any]:
+    global CATALOG_RUNTIME, CATALOG_LOADED_AT
+    async with catalog_lock:
+        res = await gs_get_catalog()
+        if not res.get("ok"):
+            return res
+        try:
+            new_cat = _build_catalog_runtime(res)
+            CATALOG_RUNTIME = new_cat
+            CATALOG_LOADED_AT = now_str()
+            log.info("📦 catalog refreshed (%s) categories=%d", reason, len(CATALOG_RUNTIME))
+            return {"ok": True, "categories": len(CATALOG_RUNTIME), "loaded_at": CATALOG_LOADED_AT}
+        except Exception as e:
+            log.error("catalog parse failed: %r", e)
+            log.error(traceback.format_exc())
+            return {"ok": False, "error": f"catalog parse failed: {repr(e)}"}
+
+
 # =========================
 # Bot + Dispatcher
 # =========================
@@ -411,6 +516,36 @@ dp.update.middleware(CrashGuardMiddleware())
 
 
 # =========================
+# Admin catalog commands
+# =========================
+@dp.message(Command("refresh_catalog"))
+async def cmd_refresh_catalog(m: Message):
+    if ADMIN_IDS and m.from_user.id not in ADMIN_IDS:
+        return
+    await safe_send(m, "⏳ Оновлюю каталог з Google Sheets...")
+    res = await refresh_catalog("manual")
+    if res.get("ok"):
+        await safe_send(m, f"✅ Каталог оновлено. Категорій: {res.get('categories')} | {res.get('loaded_at')}")
+    else:
+        await safe_send(m, f"❌ Не вдалося оновити каталог: {res}")
+
+
+@dp.message(Command("catalog_info"))
+async def cmd_catalog_info(m: Message):
+    if ADMIN_IDS and m.from_user.id not in ADMIN_IDS:
+        return
+    src = _active_catalog()
+    total_items = sum(len(v) for v in src.values())
+    await safe_send(
+        m,
+        f"📦 Catalog info\n"
+        f"loaded_at={CATALOG_LOADED_AT}\n"
+        f"categories={len(src)} items={total_items}\n"
+        f"source={'GS' if CATALOG_RUNTIME else 'fallback'}"
+    )
+
+
+# =========================
 # Admin debug
 # =========================
 @dp.message(Command("debug_state"))
@@ -423,7 +558,8 @@ async def debug_state(m: Message):
         f"DEBUG boot_id={boot_id} pid={process_id}\nuser={uid}\n"
         f"draft={draft.get(uid)}\ncart={carts.get(uid)}\nqueue={update_queue.qsize()}\n"
         f"workers={WORKERS} inflight_limit={MAX_INFLIGHT}\n"
-        f"drop_pending={DROP_PENDING_UPDATES}"
+        f"drop_pending={DROP_PENDING_UPDATES}\n"
+        f"catalog_loaded_at={CATALOG_LOADED_AT} runtime_categories={len(CATALOG_RUNTIME)}"
     )
 
 
@@ -542,11 +678,13 @@ async def cats(cb: CallbackQuery):
 @dp.callback_query(F.data.startswith("cat:"))
 async def cat(cb: CallbackQuery):
     cat_name = cb.data.split(":", 1)[1]
-    items = CATALOG.get(cat_name, [])
+    items = _active_catalog().get(cat_name, [])
     kb = []
     for it in items:
+        status = str(it.get("status") or "IN_STOCK").strip()
+        mark = "✅" if status == "IN_STOCK" else "⏳"
         kb.append([InlineKeyboardButton(
-            text=f"{it['title']} — {it['price']} {CURRENCY}",
+            text=f"{mark} {it['title']} — {it['price']} {CURRENCY}",
             callback_data=f"prod:{it['sku']}"
         )])
     kb.append([InlineKeyboardButton(text="🧺 Кошик", callback_data="cart")])
@@ -568,20 +706,28 @@ async def prod(cb: CallbackQuery):
         await tg_call(cb.answer("Товар не знайдено", show_alert=True), what="cb.answer(prod_not_found)")
         return
 
+    status = str(item.get("status") or "IN_STOCK").strip()
+    can_add = (status == "IN_STOCK")
+
+    desc = (item.get("description") or "").strip()
+    status_line = "✅ В наявності" if can_add else f"⏳ Статус: {status}"
+
     text = (
         f"🧾 {item['title']}\n"
-        f"💰 Ціна: {item['price']} {CURRENCY}\n\n"
+        f"💰 Ціна: {item['price']} {CURRENCY}\n"
+        f"{status_line}\n\n"
+        f"{desc}\n\n"
         "Додати в кошик?"
-    )
+    ).strip()
 
-    photo_id = (item.get("photo") or "").strip()
-    if photo_id:
+    photo_ref = (item.get("photo") or "").strip()
+    if photo_ref:
         await tg_call(
-            cb.message.answer_photo(photo=photo_id, caption=text, reply_markup=product_kb(sku)),
+            cb.message.answer_photo(photo=photo_ref, caption=text, reply_markup=product_kb(sku, can_add=can_add)),
             what="answer_photo"
         )
     else:
-        await tg_call(cb.message.answer(text, reply_markup=product_kb(sku)), what="answer_product_text")
+        await tg_call(cb.message.answer(text, reply_markup=product_kb(sku, can_add=can_add)), what="answer_product_text")
 
     await tg_call(cb.answer(), what="cb.answer(prod)")
 
@@ -589,6 +735,16 @@ async def prod(cb: CallbackQuery):
 @dp.callback_query(F.data.startswith("add:"))
 async def add(cb: CallbackQuery):
     sku = cb.data.split(":", 1)[1]
+    item = find_item_by_sku(sku)
+    if not item:
+        await tg_call(cb.answer("Товар не знайдено", show_alert=True), what="cb.answer(add_not_found)")
+        return
+
+    status = str(item.get("status") or "IN_STOCK").strip()
+    if status != "IN_STOCK":
+        await tg_call(cb.answer("Цього товару зараз немає в наявності ⏳", show_alert=True), what="cb.answer(add_no_stock)")
+        return
+
     carts.setdefault(cb.from_user.id, {})
     carts[cb.from_user.id][sku] = carts[cb.from_user.id].get(sku, 0) + 1
     log.info("🛒 add user=%s sku=%s qty=%s cart=%s",
@@ -776,7 +932,6 @@ async def cancel(cb: CallbackQuery):
     await safe_edit(cb, "❌ Замовлення скасовано.")
     await tg_call(cb.answer(), what="cb.answer(cancel)")
 
-    # ✅ ПОКАЗАТИ ГОЛОВНЕ МЕНЮ після cancel (всередині хендлера!)
     await tg_call(
         cb.message.answer(
             "Ок. Щоб почати заново — натисніть 🛒 Зробити замовлення або 📦 Каталог / Меню.",
@@ -839,7 +994,6 @@ async def confirm(cb: CallbackQuery):
     order_id = str(res.get("orderId", ""))
     await safe_edit(cb, f"🎉 Дякуємо! Замовлення прийнято.\nНомер: #{order_id}\nМенеджер скоро зв’яжеться.")
 
-    # ✅ ПОКАЗАТИ ГОЛОВНЕ МЕНЮ після успішного confirm (всередині хендлера!)
     await tg_call(
         bot.send_message(
             chat_id=user_id,
@@ -945,11 +1099,13 @@ async def app_lifecycle(app: web.Application):
             worker_tasks.append(t)
         app["worker_tasks"] = worker_tasks
 
+        if CATALOG_AUTOLOAD:
+            res = await refresh_catalog("boot")
+            log.info("catalog autoload result: %s", res)
+
         if WEBHOOK_BASE:
             webhook_url = f"{WEBHOOK_BASE}{WEBHOOK_PATH}"
             try:
-                # IMPORTANT:
-                # Only drop pending updates if you explicitly want to clear backlog.
                 if DROP_PENDING_UPDATES:
                     await bot.delete_webhook(drop_pending_updates=True)
 
@@ -967,11 +1123,6 @@ async def app_lifecycle(app: web.Application):
         yield  # RUNNING
 
     finally:
-        # IMPORTANT:
-        # Do NOT delete webhook on shutdown.
-        # During Render rolling restart / deploy it can DROP user messages (your exact symptom).
-        # Just stop workers and close sessions.
-
         for t in worker_tasks:
             t.cancel()
         for t in worker_tasks:
@@ -1024,6 +1175,8 @@ def build_app():
             "workers": WORKERS,
             "inflight_limit": MAX_INFLIGHT,
             "drop_pending": DROP_PENDING_UPDATES,
+            "catalog_loaded_at": CATALOG_LOADED_AT,
+            "runtime_categories": len(CATALOG_RUNTIME)
         })
 
     app.router.add_get("/", health)
@@ -1036,6 +1189,7 @@ def build_app():
 
 if __name__ == "__main__":
     web.run_app(build_app(), host="0.0.0.0", port=PORT)
+
 
 
 
