@@ -164,6 +164,7 @@ boot_ts = int(time.time())
 
 SCRIPT_SIGNATURE = "BOT_BUILD_2026-03-05__WHOAMI_FIX_V3"
 
+
 def _serialize_state() -> Dict[str, Any]:
     return {
         "meta": {"boot_id": boot_id, "pid": process_id, "boot_ts": boot_ts},
@@ -408,7 +409,6 @@ async def _gs_post(payload: Dict[str, Any]) -> Dict[str, Any]:
             text = await resp.text()
             try:
                 data = json.loads(text)
-                # attach status for debugging
                 if isinstance(data, dict):
                     data["_http_status"] = resp.status
                 return data
@@ -473,7 +473,7 @@ def _build_catalog_runtime(gs_payload: Dict[str, Any]) -> Dict[str, List[Dict[st
             "title": title,
             "description": descr,
             "price": price,
-            "photo": image_url,   # URL works for Telegram sendPhoto if public https
+            "photo": image_url,
             "status": status
         })
 
@@ -499,7 +499,6 @@ async def refresh_catalog(reason: str = "") -> Dict[str, Any]:
             log.error("catalog parse failed: %r", e)
             log.error(traceback.format_exc())
             return {"ok": False, "error": f"catalog parse failed: {repr(e)}"}
-
 
 
 async def refresh_roles(reason: str = "") -> Dict[str, Any]:
@@ -544,29 +543,43 @@ class CrashGuardMiddleware(BaseMiddleware):
         except Exception as e:
             log.error("🔥 UNHANDLED ERROR: %r", e)
             log.error(traceback.format_exc())
-            # do not crash, but also do not silently ignore in command flow
             return
 
 
-dp.update.middleware(CrashGuardMiddleware())
+class DebugLogMiddleware(BaseMiddleware):
+    """
+    Логує всі вхідні апдейти (message/callback) НЕ блокуючи хендлери.
+    """
+    async def __call__(self, handler, event: TelegramObject, data: dict):
+        try:
+            # message
+            if hasattr(event, "message") and event.message:
+                m = event.message
+                txt = (m.text or m.caption or "")
+                ents = [(e.type, e.offset, e.length) for e in (m.entities or [])][:5]
+                log.info("📩 IN msg from=%s chat=%s text=%r entities=%s",
+                         m.from_user.id if m.from_user else None,
+                         m.chat.id if m.chat else None,
+                         txt[:200],
+                         ents)
+            # callback_query
+            if hasattr(event, "callback_query") and event.callback_query:
+                cb = event.callback_query
+                log.info("🧷 IN cb from=%s data=%r",
+                         cb.from_user.id if cb.from_user else None,
+                         (cb.data or "")[:200])
+        except Exception:
+            pass
+        return await handler(event, data)
 
-@dp.message()
-async def _debug_log_all_messages(m: Message):
-    # Лише лог, без відповіді. Допомагає побачити що реально прилітає.
-    try:
-        txt = (m.text or m.caption or "")
-        log.info("📩 IN msg from=%s chat=%s text=%r entities=%s",
-                 m.from_user.id if m.from_user else None,
-                 m.chat.id if m.chat else None,
-                 txt[:200],
-                 [(e.type, e.offset, e.length) for e in (m.entities or [])][:5])
-    except Exception:
-        pass
+
+dp.update.middleware(CrashGuardMiddleware())
+dp.update.middleware(DebugLogMiddleware())
+
 
 # =========================
 # Admin commands (with roles)
 # =========================
-
 @dp.message(Command("whoami"))
 async def cmd_whoami(m: Message):
     uid = m.from_user.id
@@ -576,8 +589,10 @@ async def cmd_whoami(m: Message):
         f"your_role={_role_of(uid) or 'NONE'}\n"
         f"roles_loaded_at={ROLES_LOADED_AT}\n"
         f"roles_users={len(ROLES_RUNTIME)}\n"
-        f"admin_ids_env={sorted(list(ADMIN_IDS))}"
+        f"admin_ids_env={sorted(list(ADMIN_IDS))}\n"
+        f"script_signature={SCRIPT_SIGNATURE}"
     )
+
 
 @dp.message(Command("gs_roles_raw"))
 async def cmd_gs_roles_raw(m: Message):
@@ -587,11 +602,10 @@ async def cmd_gs_roles_raw(m: Message):
     res = await gs_get_roles()
     await safe_send(m, json.dumps(res, ensure_ascii=False)[:3500])
 
+
 @dp.message(Command("refresh_roles"))
 async def cmd_refresh_roles(m: Message):
     uid = m.from_user.id
-
-    # аварійний ключ: якщо ти в ADMIN_IDS env — можеш оновити ролі завжди
     if uid not in ADMIN_IDS and not _has_any_role(uid, {"SUPERADMIN", "ADMIN"}):
         await safe_send(m, "⛔ Немає доступу (потрібна роль ADMIN/SUPERADMIN).")
         return
@@ -609,7 +623,6 @@ async def cmd_refresh_catalog(m: Message):
         return
 
     await safe_send(m, "⏳ Оновлюю каталог з Google Sheets...")
-
     try:
         res = await refresh_catalog("manual")
         if res.get("ok"):
@@ -636,7 +649,8 @@ async def cmd_catalog_info(m: Message):
         f"categories={len(src)} items={total_items}\n"
         f"source={'GS' if CATALOG_RUNTIME else 'fallback'}\n"
         f"roles_loaded_at={ROLES_LOADED_AT} roles_users={len(ROLES_RUNTIME)}\n"
-        f"your_role={_role_of(uid)}"
+        f"your_role={_role_of(uid)}\n"
+        f"script_signature={SCRIPT_SIGNATURE}"
     )
 
 
@@ -655,13 +669,14 @@ async def debug_state(m: Message):
         f"workers={WORKERS} inflight_limit={MAX_INFLIGHT}\n"
         f"drop_pending={DROP_PENDING_UPDATES}\n"
         f"catalog_loaded_at={CATALOG_LOADED_AT} runtime_categories={len(CATALOG_RUNTIME)}\n"
-        f"roles_loaded_at={ROLES_LOADED_AT} roles_users={len(ROLES_RUNTIME)}"
+        f"roles_loaded_at={ROLES_LOADED_AT} roles_users={len(ROLES_RUNTIME)}\n"
+        f"script_signature={SCRIPT_SIGNATURE}"
     )
 
 
 @dp.message(Command("ping"))
 async def ping(m: Message):
-    await safe_send(m, f"pong ✅ boot_id={boot_id} pid={process_id}")
+    await safe_send(m, f"pong ✅ boot_id={boot_id} pid={process_id} script_signature={SCRIPT_SIGNATURE}")
 
 
 @dp.message(Command("reset"))
@@ -922,7 +937,6 @@ async def flow_contact(m: Message):
 
 @dp.message(F.text)
 async def flow(m: Message):
-    # ❗ не чіпаємо команди типу /ping /whoami /refresh_roles
     if m.text and m.text.strip().startswith("/"):
         return
 
@@ -1142,7 +1156,6 @@ async def confirm(cb: CallbackQuery):
 @dp.callback_query(F.data.startswith("st:"))
 async def set_status(cb: CallbackQuery):
     uid = cb.from_user.id
-    # allow: SUPERADMIN/ADMIN/MANAGER or MANAGER_CHAT_ID
     if uid != MANAGER_CHAT_ID and not _has_any_role(uid, {"SUPERADMIN", "ADMIN", "MANAGER"}):
         await tg_call(cb.answer("Немає доступу", show_alert=True), what="cb.answer(st_denied)")
         return
@@ -1158,15 +1171,12 @@ async def set_status(cb: CallbackQuery):
         await tg_call(cb.answer("Помилка оновлення статусу", show_alert=True), what="cb.answer(st_err)")
 
 
-
 # =========================
 # Fallback for ANY command (must be AFTER all specific command handlers)
 # =========================
 @dp.message(Command())
 async def any_command_fallback(m: Message):
-    # Якщо сюди потрапили — значить специфічний хендлер не спрацював.
     cmd = (m.text or "").split()[0]
-
     await safe_send(
         m,
         "🤖 Команду отримав, але відповідний хендлер не спрацював.\n\n"
@@ -1179,7 +1189,6 @@ async def any_command_fallback(m: Message):
         "/debug_state\n\n"
         "Якщо навіть /ping не відповідає — значить деплой/код не той або webhook веде не туди."
     )
-
 
 
 # =========================
@@ -1217,6 +1226,7 @@ async def app_lifecycle(app: web.Application):
     global gs_http
     log.info("🚀 BOOT boot_id=%s pid=%s drop_pending=%s", boot_id, process_id, DROP_PENDING_UPDATES)
     log.info("🧩 SCRIPT_SIGNATURE=%s", SCRIPT_SIGNATURE)
+
     worker_tasks: List[asyncio.Task] = []
 
     try:
@@ -1230,7 +1240,6 @@ async def app_lifecycle(app: web.Application):
             worker_tasks.append(t)
         app["worker_tasks"] = worker_tasks
 
-        # auto-load roles first
         if ROLES_AUTOLOAD:
             rr = await refresh_roles("boot")
             log.info("roles autoload result: %s", rr)
@@ -1303,20 +1312,20 @@ def build_app():
         return web.Response(text="ok")
 
     async def healthz(_request):
-    return web.json_response({
-        "ok": True,
-        "script_signature": SCRIPT_SIGNATURE,
-        "boot_id": boot_id,
-        "pid": process_id,
-        "queue": update_queue.qsize(),
-        "workers": WORKERS,
-        "inflight_limit": MAX_INFLIGHT,
-        "drop_pending": DROP_PENDING_UPDATES,
-        "catalog_loaded_at": CATALOG_LOADED_AT,
-        "runtime_categories": len(CATALOG_RUNTIME),
-        "roles_loaded_at": ROLES_LOADED_AT,
-        "roles_users": len(ROLES_RUNTIME),
-    })
+        return web.json_response({
+            "ok": True,
+            "script_signature": SCRIPT_SIGNATURE,
+            "boot_id": boot_id,
+            "pid": process_id,
+            "queue": update_queue.qsize(),
+            "workers": WORKERS,
+            "inflight_limit": MAX_INFLIGHT,
+            "drop_pending": DROP_PENDING_UPDATES,
+            "catalog_loaded_at": CATALOG_LOADED_AT,
+            "runtime_categories": len(CATALOG_RUNTIME),
+            "roles_loaded_at": ROLES_LOADED_AT,
+            "roles_users": len(ROLES_RUNTIME),
+        })
 
     app.router.add_get("/", health)
     app.router.add_get("/healthz", healthz)
@@ -1328,6 +1337,7 @@ def build_app():
 
 if __name__ == "__main__":
     web.run_app(build_app(), host="0.0.0.0", port=PORT)
+
 
 
 
