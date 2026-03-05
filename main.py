@@ -678,6 +678,13 @@ async def debug_state(m: Message):
 async def ping(m: Message):
     await safe_send(m, f"pong ✅ boot_id={boot_id} pid={process_id} script_signature={SCRIPT_SIGNATURE}")
 
+@dp.message(Command("chatid"))
+async def cmd_chatid(m: Message):
+    uid = m.from_user.id
+    if uid not in ADMIN_IDS and not _has_any_role(uid, {"SUPERADMIN", "ADMIN"}):
+        return
+    await safe_send(m, f"chat_id={m.chat.id}\nchat_type={m.chat.type}")
+
 
 @dp.message(Command("reset"))
 async def reset(m: Message):
@@ -1153,22 +1160,7 @@ async def confirm(cb: CallbackQuery):
     await save_state("confirm_done")
 
 
-@dp.callback_query(F.data.startswith("st:"))
-async def set_status(cb: CallbackQuery):
-    uid = cb.from_user.id
-    if uid != MANAGER_CHAT_ID and not _has_any_role(uid, {"SUPERADMIN", "ADMIN", "MANAGER"}):
-        await tg_call(cb.answer("Немає доступу", show_alert=True), what="cb.answer(st_denied)")
-        return
-
-    _, order_id, status, user_tg_id = cb.data.split(":", 3)
-    res = await gs_update_status(order_id, status)
-
-    if res.get("ok"):
-        await tg_call(cb.answer(f"Статус: {status} ✅"), what="cb.answer(st_ok)")
-        await tg_call(bot.send_message(int(user_tg_id), f"📦 Статус замовлення #{order_id}: {status}"),
-                      what="notify_user_status")
-    else:
-        await tg_call(cb.answer("Помилка оновлення статусу", show_alert=True), what="cb.answer(st_err)")
+F.data.startswith("st:")
 
 
 # =========================
@@ -1337,6 +1329,7 @@ def build_app():
 
 if __name__ == "__main__":
     web.run_app(build_app(), host="0.0.0.0", port=PORT)
+
 
 
 
