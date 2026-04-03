@@ -985,7 +985,7 @@ async def flow(m: Message):
             draft[user_id]["address"] = "-"
             draft[user_id]["step"] = "datetime"
             await save_state("delivery_pickup")
-            await safe_send(m, "🕒 Вкажіть біжіну дату/час (наприклад: завтра 14:00):")
+            await safe_send(m, "Вкажіть необхідний вам розмір:")
             return
 
         if "Доставка" in text:
@@ -1002,7 +1002,7 @@ async def flow(m: Message):
         draft[user_id]["address"] = text
         draft[user_id]["step"] = "datetime"
         await save_state("address")
-        await safe_send(m, "🕒 Вкажіть бажану дату/час (наприклад: сьогодні 19:30):")
+        await safe_send(m, "Вкажіть необхідний вам розмір:")
         return
 
     if step == "datetime":
